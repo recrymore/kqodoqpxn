@@ -188,7 +188,7 @@ def gate(chat,uid):
 
 def gift_pack(items,mode):
     title=f'✦ GIFT RADAR | ПОДБОРКА\n━━━━━━━━━━━━━━\n🔎 Найдено подарков: {len(items)} шт.'
-    if any(g.get('source')=='See.tg' for g in items):title+='\nИсточник: See.tg · оценка не равна цене продажи.'
+    if any(g.get('source')=='See.tg' for g in items):title+='\nДанные: https://see.tg · оценка не равна цене продажи.'
     elif mode in PRICE_MODES:title+='\nЦены из каталога администратора; проверь на площадке.'
     if not items:title+='\nСовпадений пока нет. Попробуй другой запрос.'
     def short(value):
@@ -243,7 +243,7 @@ def callback(q):
     elif action=='prices':send(chat,'💎 Выбери бюджет в TON.\nДо 5 · 5–20 · 20–999.999',ik([[('До 5','low'),('5–20','mid')],[('20+','high'),('Все цены','all')],[('← Меню','home')]]))
     elif action=='filters':send(chat,'🎛 Фильтры по атрибутам\nВведи, например: /find model=Steel; backdrop=Black; symbol=Star\nКоллекции: '+', '.join(COLLECTIONS)+'\nЛюбое поле можно пропустить.',ik([[('← Меню','home')]]))
     elif action=='random' and see_enabled(uid):
-        send(chat,'Выбери размер подборки See.tg (случайная выборка из первой страницы).',ik([[('10 NFT','see_random_10'),('25 NFT','see_random_25'),('50 NFT','see_random_50')],[('← Меню','home')]]))
+        send(chat,'Выбери размер подборки (случайная выборка из первой страницы).',ik([[('10 NFT','see_random_10'),('25 NFT','see_random_25'),('50 NFT','see_random_50')],[('← Меню','home')]]))
     elif action in ('see_random_10','see_random_25','see_random_50'):
         if not see_enabled(uid):return
         try:show_gifts(chat,search_gifts(uid,int(action.rsplit('_',1)[1])),'random')
@@ -317,7 +317,7 @@ def send(chat,text,markup=None):
     kw={'chat_id':chat,'text':text}
     if markup:kw['reply_markup']=markup
     return api('sendMessage',**kw)
-MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'👁 Показать / скрыть баннер'}],[{'text':'🏷 Название'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'🔐 Текст подписки'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'📊 Квота See.tg'},{'text':'Отмена'}]],'resize_keyboard':True}
+MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'👁 Показать / скрыть баннер'}],[{'text':'🏷 Название'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'🔐 Текст подписки'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'📊 Лимит запросов'},{'text':'Отмена'}]],'resize_keyboard':True}
 OPTIONS={'🔐 Текст подписки':('access_text','Введи текст просьбы о подписке до 500 символов.'),'👋 Приветствие':('welcome','Введи приветствие до 500 символов.'),'🔘 Кнопка запуска':('button_text','Введи подпись кнопки до 48 символов.'),'✏️ Верхний баннер':('banner','Введи текст баннера до 240 символов.'),'🏷 Название':('title','Введи название до 64 символов.'),'💬 Контакт поддержки':('support','Введи @username поддержки или «-».')}
 def summary():
     c=read_config()
@@ -351,8 +351,8 @@ def handle(msg):
         except (ValueError,GiftError) as e:send(chat,'Ошибка поиска: '+str(e))
         return
     if uid not in ADMIN_IDS:return
-    if command=='/seequota' or text=='📊 Квота See.tg':
-        try:send(chat,'Остаток бесплатных запросов See.tg: '+str(see_api.client.quota()))
+    if command in ('/quota','/seequota') or text=='📊 Лимит запросов':
+        try:send(chat,'Остаток бесплатных запросов: '+str(see_api.client.quota()))
         except GiftError as e:send(chat,str(e))
         return
     if command=='/gift':
@@ -385,7 +385,7 @@ def handle(msg):
         if not rows:send(chat,'Нет открытых обращений.',MENU)
         for r in rows:send(chat,f"#{r['id']} · {r['kind']}\n{r['body']}\n/reply {r['id']} текст")
         return
-    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением\nSee.tg (тест владельца): /seequota; /gift PlushPepe-1\nКаталог V7: /lot slug цена_TON; /unlot slug',MENU);return
+    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением\nРыночные данные (тест владельца): /quota; /gift PlushPepe-1\nКаталог V7: /lot slug цена_TON; /unlot slug',MENU);return
     if command=='/cancel' or text=='Отмена':pending.pop(uid,None);send(chat,'Изменение отменено.',MENU);return
     if text in OPTIONS:
         key,prompt=OPTIONS[text];pending[uid]=key;send(chat,prompt,{'keyboard':[[{'text':'Отмена'}]],'resize_keyboard':True});return

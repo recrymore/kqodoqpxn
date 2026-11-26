@@ -52,9 +52,9 @@ class Client:
         self.opener=build_opener(NoRedirect())
     def _request(self,path,params=None):
         token=os.environ.get('SEE_API_KEY','').strip()
-        if not token:raise GiftError('SEE_API_KEY не настроен.')
+        if not token:raise GiftError('Подключение к источнику данных не настроено.')
         now=time.monotonic()
-        if now<self.blocked:raise GiftError('See.tg временно ограничил запросы. Попробуй позже.')
+        if now<self.blocked:raise GiftError('Источник данных временно ограничил запросы. Попробуй позже.')
         if self.last:time.sleep(max(0,1.2-(now-self.last)))
         self.last=time.monotonic()
         req=Request(BASE+path+('?' + urlencode(params) if params else ''),headers={'Authorization':'Bearer '+token,'Accept':'application/json','User-Agent':'GiftRadar/1.0'})
@@ -64,7 +64,7 @@ class Client:
                 try:self.remaining=int(resp.headers.get('X-Free-Remaining',''))
                 except (ValueError,TypeError):self.remaining=None
                 log.info('see endpoint=%s HTTP=%s free=%s',path.split('/')[0],resp.status,self.remaining)
-                if not isinstance(payload,dict) or payload.get('ok') is not True:raise GiftError('See.tg вернул неожиданный ответ.')
+                if not isinstance(payload,dict) or payload.get('ok') is not True:raise GiftError('Источник данных вернул неожиданный ответ.')
                 return payload.get('result')
         except HTTPError as e:
             log.warning('see endpoint=%s HTTP=%s',path.split('/')[0],e.code)
@@ -73,8 +73,8 @@ class Client:
                 except (ValueError,TypeError):wait=60
                 self.blocked=time.monotonic()+wait
             if e.code in (403,525):self.blocked=time.monotonic()+60
-            raise GiftError({401:'See.tg: проверь токен.',402:'See.tg: бесплатная квота закончилась.',403:'See.tg: доступ запрещён.',404:'Подарок не найден.',429:'See.tg: лимит запросов.',525:'See.tg: временная ошибка TLS.'}.get(e.code,f'See.tg: HTTP {e.code}.')) from None
-        except (URLError,TimeoutError,OSError,ValueError):raise GiftError('See.tg: ошибка сети или формата ответа.') from None
+            raise GiftError({401:'Источник данных: проверь токен.',402:'Источник данных: бесплатная квота закончилась.',403:'Источник данных: доступ запрещён.',404:'Подарок не найден.',429:'Источник данных: лимит запросов.',525:'Источник данных: временная ошибка TLS.'}.get(e.code,f'Источник данных: HTTP {e.code}.')) from None
+        except (URLError,TimeoutError,OSError,ValueError):raise GiftError('Источник данных: ошибка сети или формата ответа.') from None
     def quota(self):
         with self.lock:
             self._request('me')
@@ -82,7 +82,7 @@ class Client:
     def _free(self):
         # Recheck quota every cache miss; no billable calls after quota is exhausted.
         self._request('ping')
-        if self.remaining is None or self.remaining<1:raise GiftError('Бесплатная квота See.tg не подтверждена или закончилась. Запрос отменён.')
+        if self.remaining is None or self.remaining<1:raise GiftError('Бесплатная квота не подтверждена или закончилась. Запрос отменён.')
     def search(self,count,filters=None,mode=None):
         if type(count) is not int or not 1<=count<=MAX_BATCH:raise ValueError('Количество: от 1 до 50.')
         filters=filters or {}
@@ -104,7 +104,7 @@ class Client:
                 items=cached[1];log.info('see cache hit count=%s',len(items))
             else:
                 self._free();data=self._request('gifts',params)
-                if not isinstance(data,dict) or not isinstance(data.get('items'),list):raise GiftError('See.tg: неизвестная структура списка.')
+                if not isinstance(data,dict) or not isinstance(data.get('items'),list):raise GiftError('Источник данных: неизвестная структура списка.')
                 items=list({g['slug']:g for x in data['items'] if (g:=normalize(x))}.values())
                 if len(self.cache)>=32:self.cache.pop(next(iter(self.cache)))
                 self.cache[key]=(time.monotonic(),items)
@@ -114,7 +114,7 @@ class Client:
         with self.lock:
             self._free();raw=self._request('gift/'+slug)
         item=normalize(raw)
-        if item is None:raise GiftError('See.tg: структура карточки не распознана.')
+        if item is None:raise GiftError('Источник данных: структура карточки не распознана.')
         # Single, explicit inspection in admin private chat only; never cached/exported in batches.
         owner=raw.get('owner')
         if isinstance(owner,dict) and owner.get('seeType')=='public' and owner.get('telegramType')=='user':
