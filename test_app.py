@@ -132,6 +132,6 @@ class Tests(unittest.TestCase):
         _,rows=app.gift_pack([self.card()],'random')
         buttons=app.ik(rows)['inline_keyboard'][0]
         self.assertEqual(buttons[0]['url'],self.card()['url'])
-        self.assertEqual(buttons[1]['copy_text']['text'],self.card()['url'])
-        self.assertNotIn('callback_data',buttons[1])
+        self.assertEqual(len(buttons),1)
+        self.assertNotIn('copy_text',buttons[0])
 if __name__=='__main__':unittest.main()

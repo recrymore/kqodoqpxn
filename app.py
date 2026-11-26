@@ -264,7 +264,7 @@ def gift_pack(items,mode,*,single_card=False,group_delivery=False):
         return value if len(value)<=60 else value[:59]+'…'
     for i,g in enumerate(items,1):
         title+=f"\n\n{i:02d} ┃ {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+(f" · оценка {g['estimate_ton']:.2f} TON" if 'estimate_ton' in g else '')+f"\n{short(g['model'])} · {short(g['backdrop'])} · {short(g['symbol'])}"
-    rows=[[(f"{i:02d} · Подарок",g['url']),("Копия",{'copy_text':{'text':g['url']}})] for i,g in enumerate(items,1)]
+    rows=[[("🎁 Подарок" if single_card else f"{i:02d} · Подарок",g['url'])] for i,g in enumerate(items,1)]
     return title,rows
 
 OWNER_MESSAGES={
@@ -464,7 +464,7 @@ def handle(msg):
             title+='\n\nПубличный владелец: '+item['owner_display']
             username=item.get('public_username','')
             if item.get('owner_status')=='available' and re.fullmatch(r'@[A-Za-z0-9_]{4,32}',username):
-                rows=[[('Подарок',item['url']),('ЛС','https://t.me/'+username[1:])]]
+                rows=[[('🎁 Подарок',item['url']),('💬 ЛС','https://t.me/'+username[1:])]]
             send(chat,title,ik(rows))
         except (GiftError,ValueError) as e:send(chat,str(e))
         return
