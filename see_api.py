@@ -38,7 +38,10 @@ def card_shape(raw):
     if not isinstance(raw, dict):
         return {'result': type(raw).__name__}
     result = {}
-    for label, data in [('result', raw), ('details', raw.get('details'))]:
+    gift = raw.get('gift')
+    nested_details = gift.get('details') if isinstance(gift, dict) else None
+    # Known schema paths only, no response values.
+    for label, data in [('result', raw), ('details', raw.get('details')), ('gift', gift), ('gift.details', nested_details)]:
         result[label] = type(data).__name__
         if isinstance(data, dict):
             for key in ('slug', 'num', 'title', 'model', 'backdrop', 'pattern', 'estimate'):
@@ -69,12 +72,26 @@ def numeric(v):
 
 def normalize(raw):
     if not isinstance(raw,dict): return None
+    # A single gift response may wrap its card in result.gift; batches
+    # may still return flat cards. Do not invent an identifier from the request.
     details=raw.get('details') if isinstance(raw.get('details'),dict) else {}
-    # Only whitelisted gift fields cross the adapter boundary.
-    def field(k): return raw.get(k) if raw.get(k) is not None else details.get(k)
-    slug=gift_ref(field('slug'), field('num'))
-    if slug is None: return None
-    est=raw.get('estimate') if isinstance(raw.get('estimate'),dict) else {}
+    gift=raw.get('gift') if isinstance(raw.get('gift'),dict) else {}
+    nested=gift.get('details') if isinstance(gift.get('details'),dict) else {}
+    levels=(raw, details, gift, nested)
+    def field(k):
+        return next((level[k] for level in levels if level.get(k) is not None), None)
+    # Keep number and slug within the same card, not an unrelated wrapper.
+    refs=[]
+    for primary, secondary in ((raw, details), (gift, nested)):
+        value=primary.get('slug') if primary.get('slug') is not None else secondary.get('slug')
+        num=primary.get('num') if primary.get('num') is not None else secondary.get('num')
+        if value is not None:
+            ref=gift_ref(value,num)
+            if ref is None: return None
+            refs.append(ref)
+    if not refs or len({ref.casefold() for ref in refs}) != 1: return None
+    slug=refs[0]
+    est=next((level['estimate'] for level in levels if isinstance(level.get('estimate'),dict)),{})
     item={'slug':slug,'name':clean(field('title')),'number':int(slug.rsplit('-',1)[1]),'url':'https://t.me/nft/'+slug,'model':clean(field('model')),'backdrop':clean(field('backdrop')),'symbol':clean(field('pattern')),'source':'See.tg','on_sale':field('onSale') is True}
     for k,target in [('ton','estimate_ton'),('low','estimate_low'),('high','estimate_high')]:
         v=numeric(est.get(k))
@@ -160,6 +177,7 @@ class Client:
         if item['slug'].casefold() != slug.casefold():
             log.warning('gift card identifier mismatch')
             raise GiftError('Источник данных: получена карточка другого подарка.')
+        log.info('gift card schema accepted')
         # Single, explicit inspection in admin private chat only; never cached/exported in batches.
         owner=raw.get('owner')
         if isinstance(owner,dict) and owner.get('seeType')=='public' and owner.get('telegramType')=='user':

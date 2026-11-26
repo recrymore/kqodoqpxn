@@ -13,6 +13,23 @@ class SeeTests(unittest.TestCase):
         item=see_api.normalize(raw());self.assertEqual(item['estimate_ton'],12.5);self.assertEqual(item['model'],'Steel');self.assertNotIn('owner',item);self.assertNotIn('example_owner',str(item))
     def test_details(self):
         item=see_api.normalize({'details':raw(),'estimate':{'ton':15}});self.assertEqual(item['slug'],'PlushPepe-1');self.assertEqual(item['estimate_ton'],15)
+    def test_nested_card(self):
+        data={'estimate':{'ton':15},'gift':{'details':{'slug':'PlushPepe','num':1,'title':'Plush Pepe','model':'Steel','backdrop':'Black','pattern':'Star'}}}
+        item=see_api.normalize(data)
+        self.assertEqual(item['slug'],'PlushPepe-1')
+        self.assertEqual(item['model'],'Steel')
+        self.assertEqual(item['estimate_ton'],15)
+        with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
+            self.assertEqual(self.c.single('PlushPepe-1')['number'],1)
+            with self.assertRaises(GiftError):self.c.single('PlushPepe-2')
+    def test_nested_flat_card(self):
+        self.assertEqual(see_api.normalize({'gift':raw()})['slug'],'PlushPepe-1')
+        self.assertIsNone(see_api.normalize({'slug':'PlushPepe-2','gift':raw()}))
+        self.assertIsNone(see_api.normalize({'estimate':{'ton':15}}))
+    def test_nested_diagnostics(self):
+        shape=see_api.card_shape({'gift':{'details':{'slug':'PlushPepe','num':1},'owner':{'username':'private_owner'}}})
+        self.assertEqual(shape['gift.details.slug_format'],'collection')
+        self.assertNotIn('private_owner',str(shape))
     def test_split_slug(self):
         data={'details':{'slug':'PlushPepe','num':1,'title':'Plush Pepe','model':'Steel','backdrop':'Black','pattern':'Star'},'estimate':{'ton':15}}
         item=see_api.normalize(data)
