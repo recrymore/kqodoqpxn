@@ -1,0 +1,55 @@
+name: Tracker Bot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracker-test
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Cloudflare Tunnel
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+      - name: Start Tracker
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          HOST: "127.0.0.1"
+          PORT: "8000"
+        run: |
+          test -n "$BOT_TOKEN"
+          test -n "$ADMIN_IDS"
+
+          ./cloudflared tunnel --url http://127.0.0.1:8000 > tunnel.log 2>&1 &
+
+          for i in $(seq 1 60); do
+            WEBAPP_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+            if [ -n "$WEBAPP_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          test -n "$WEBAPP_URL"
+          export WEBAPP_URL
+          echo "Mini App: $WEBAPP_URL"
+          python -u app.py
