@@ -57,20 +57,20 @@ def fetch_card(slug):
 
 MAX_BATCH=10
 _job=threading.Lock();_last_job=0.
-def random_gifts(count, filters=None):
+def random_gifts(count, filters=None, *, exclude=None):
     global _last_job
     if type(count) is not int or not 1<=count<=MAX_BATCH:raise ValueError(f'Выбери от 1 до {MAX_BATCH} подарков.')
     filters=validate_filters(filters)
     if not _job.acquire(blocking=False):raise GiftError('Подборка уже выполняется. Попробуй чуть позже.')
     try:
         if time.monotonic()-_last_job<10 and _last_job:raise GiftError('Подожди несколько секунд перед новой подборкой.')
-        _last_job=time.monotonic();results=[];seen=set()
+        _last_job=time.monotonic();results=[];seen={str(x).casefold() for x in (exclude or ())}
         deadline=time.monotonic()+40
         for _ in range(min(20,count+8) if filters else min(20,count+5)):
             if time.monotonic()>=deadline:break
             collection=filters.get('collection') or random.choice(list(COLLECTIONS));slug=f'{collection}-{random.randint(1,COLLECTIONS[collection][1])}'
-            if slug in seen:continue
-            seen.add(slug)
+            if slug.casefold() in seen:continue
+            seen.add(slug.casefold())
             try:item=fetch_card(slug)
             except GiftError:
                 if results:break

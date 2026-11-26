@@ -136,7 +136,7 @@ class Client:
         # Recheck quota every cache miss; no billable calls after quota is exhausted.
         self._request('ping')
         if self.remaining is None or self.remaining<1:raise GiftError('Бесплатная квота не подтверждена или закончилась. Запрос отменён.')
-    def search(self,count,filters=None,mode=None):
+    def search(self,count,filters=None,mode=None,*,exclude=None):
         if type(count) is not int or not 1<=count<=MAX_BATCH:raise ValueError('Количество: от 1 до 50.')
         filters=filters or {}
         if not isinstance(filters,dict) or set(filters)-{'collection','model','backdrop','symbol'}:raise ValueError('Некорректные фильтры.')
@@ -151,21 +151,37 @@ class Client:
             if mode=='mid':params.update(price_from=5_000_000_000,price_to=19_999_999_999)
             if mode=='high':params['price_from']=20_000_000_000
         key=tuple(sorted(params.items()))
+        excluded={str(x).casefold() for x in (exclude or ())}
         with self.lock:
             cached=self.cache.get(key)
-            if cached and time.monotonic()-cached[0]<300:
-                items=cached[1];log.info('see cache hit count=%s',len(items))
-            else:
-                self._free();data=self._request('gifts',params)
+            fresh=cached and time.monotonic()-cached[0]<300
+            items=cached[1] if fresh else []
+            cursor=cached[2] if fresh else None
+            available=[g for g in items if g['slug'].casefold() not in excluded]
+            # At most one new page per interactive request. Never scan in the background.
+            advance=bool(fresh and exclude is not None and len(available)<count and cursor)
+            if not fresh or advance:
+                request_params=dict(params)
+                if advance:request_params['cursor']=cursor
+                try:
+                    self._free();data=self._request('gifts',request_params)
+                except GiftError:
+                    if available:return random.sample(available,min(count,len(available)))
+                    raise
                 if not isinstance(data,dict) or not isinstance(data.get('items'),list):raise GiftError('Источник данных: неизвестная структура списка.')
-                items=list({g['slug']:g for x in data['items'] if (g:=normalize(x))}.values())
-                log.info('gift batch returned=%s recognized=%s', len(data['items']), len(items))
-                if data['items'] and not items:
-                    log.warning('gift batch schema rejected: %s', card_shape(data['items'][0]))
+                page=list({g['slug'].casefold():g for x in data['items'] if (g:=normalize(x))}.values())
+                log.info('gift batch returned=%s recognized=%s next_page=%s',len(data['items']),len(page),advance)
+                if data['items'] and not page:
+                    log.warning('gift batch schema rejected: %s',card_shape(data['items'][0]))
                     raise GiftError('Источник данных: структура списка подарков не распознана.')
-                if len(self.cache)>=32:self.cache.pop(next(iter(self.cache)))
-                self.cache[key]=(time.monotonic(),items)
-        return random.sample(items,min(count,len(items)))
+                next_cursor=data.get('nextCursor')
+                if not isinstance(next_cursor,str) or not next_cursor or len(next_cursor)>4096 or next_cursor==cursor:next_cursor=None
+                items=list({g['slug'].casefold():g for g in (available if advance else [])+page}.values())
+                if len(self.cache)>=32 and key not in self.cache:self.cache.pop(next(iter(self.cache)))
+                self.cache[key]=(time.monotonic(),items,next_cursor)
+                available=[g for g in items if g['slug'].casefold() not in excluded]
+            else:log.info('gift cache hit available=%s',len(available))
+            return random.sample(available,min(count,len(available)))
     def single(self,slug):
         if not isinstance(slug,str) or not SLUG.fullmatch(slug):raise ValueError('Формат: /gift PlushPepe-1')
         with self.lock:
@@ -183,16 +199,31 @@ class Client:
         containers=(raw, gift) if isinstance(gift,dict) else (raw,)
         owners=[level['owner'] for level in containers if level.get('owner') is not None]
         names=[]
+        status='missing_owner' if not owners else 'unrecognized'
+        # Keep the existing display policy. Report why it rejected a card,
+        # without printing owner identifiers or any raw response values.
         for owner in owners:
-            if not isinstance(owner,dict) or owner.get('seeType')!='public' or owner.get('telegramType')!='user':
-                break
+            if not isinstance(owner,dict):
+                status='unrecognized';break
+            if owner.get('seeType')=='hidden':
+                status='hidden';break
+            if owner.get('seeType')!='public':
+                status='not_public' if isinstance(owner.get('seeType'),str) else 'unrecognized';break
+            if owner.get('telegramType')!='user':
+                status='other_owner_type' if isinstance(owner.get('telegramType'),str) else 'unrecognized';break
             u=owner.get('username')
+            if u is None or (isinstance(u,str) and not u.strip()):
+                status='missing_username';break
             if not isinstance(u,str) or not re.fullmatch(r'[A-Za-z0-9_]{4,32}',u):
-                break
+                status='unrecognized';break
             names.append(u)
         else:
             if names and len({name.casefold() for name in names})==1:
                 item['public_username']='@'+names[0]
-        log.info('public owner display=%s', 'available' if 'public_username' in item else 'unavailable')
+                status='available'
+            elif names:
+                status='conflicting_owner'
+        item['owner_status']=status
+        log.info('public owner display=%s reason=%s', 'available' if 'public_username' in item else 'unavailable', status)
         return item
 client=Client()

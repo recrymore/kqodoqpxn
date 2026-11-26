@@ -1,4 +1,5 @@
-import unittest, os, json, io
+import unittest, os, json, io, tempfile
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 from urllib.error import HTTPError
 import see_api, app
@@ -8,7 +9,10 @@ def raw(num=1):
     return {'slug':f'PlushPepe-{num}','title':'Plush Pepe','model':{'name':'Steel'},'backdrop':'Black','pattern':'Star','estimate':{'ton':12.5,'confidence':'low'},'owner':{'seeType':'public','telegramType':'user','username':'example_owner','telegramId':'1234'},'onSale':True}
 
 class SeeTests(unittest.TestCase):
-    def setUp(self): self.c=see_api.Client()
+    def setUp(self):
+        self.c=see_api.Client()
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
+        dbpatch=patch.object(app,'DB',Path(temp.name)/'db.sqlite');dbpatch.start();self.addCleanup(dbpatch.stop)
     def test_projection(self):
         item=see_api.normalize(raw());self.assertEqual(item['estimate_ton'],12.5);self.assertEqual(item['model'],'Steel');self.assertNotIn('owner',item);self.assertNotIn('example_owner',str(item))
     def test_details(self):
@@ -95,10 +99,30 @@ class SeeTests(unittest.TestCase):
         data={'gift':raw()};data['gift']['owner'].pop('username')
         with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
             self.assertNotIn('public_username',self.c.single('PlushPepe-1'))
+    def test_owner_status_diagnostics(self):
+        for owner,expected in [
+            (None,'missing_owner'),
+            ({'seeType':'hidden','username':'private_name'},'hidden'),
+            ({'seeType':'public','telegramType':'user'},'missing_username'),
+            ({'seeType':'public','telegramType':'channel'},'other_owner_type'),
+            ({'seeType':'other'},'not_public'),
+            ({'seeType':'public','telegramType':'user','username':[]},'unrecognized'),
+            ({'seeType':'public','telegramType':'user','username':'example_owner'},'available'),
+        ]:
+            with self.subTest(expected=expected):
+                data=raw();data['owner']=owner
+                with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data),self.assertLogs('see',level='INFO') as logs:
+                    item=self.c.single('PlushPepe-1')
+                self.assertEqual(item['owner_status'],expected)
+                self.assertEqual('public_username' in item,expected=='available')
+                self.assertIn('reason='+expected,str(logs.output))
+                self.assertNotIn('private_name',str(logs.output))
+                self.assertNotIn('example_owner',str(logs.output))
+                self.assertNotIn('owner_status',see_api.normalize(data))
     def test_admin_boundary(self):
         with patch.object(app,'ADMIN_IDS',{99}),patch.object(see_api,'enabled',return_value=True),patch.object(see_api.client,'search',return_value=[]) as api,patch.object(app,'random_gifts',return_value=[]) as old:
             app.search_gifts(123,10);api.assert_not_called();old.assert_called_once_with(10)
-            app.search_gifts(99,50);api.assert_called_once_with(50,None,None)
+            app.search_gifts(99,50);api.assert_called_once_with(50,None,None,exclude=set())
     def test_rate_limit(self):
         with patch.dict(os.environ,{'SEE_API_KEY':'test-secret'}),patch.object(self.c.opener,'open',side_effect=HTTPError('https://kartoshka.free/v1/ping',429,'limit',{'Retry-After':'70'},io.BytesIO())) as op:
             with self.assertRaises(GiftError):self.c.quota()
