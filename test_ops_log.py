@@ -11,7 +11,7 @@ class OpsTests(unittest.TestCase):
     def msg(self,uid,cmd,group=True):
         return {'chat':{'id':-123 if group else uid,'type':'supergroup' if group else 'private'},'from':{'id':uid},'text':cmd}
     def test_only_admin_can_bind(self):
-        with patch.object(app,'logs_allowed',return_value=True),patch.object(app,'send'):
+        with patch.object(app,'logs_check',return_value=None),patch.object(app,'send'):
             app.handle(self.msg(123,'/logs_here')); self.assertIsNone(app.logs_destination())
             app.handle(self.msg(99,'/logs_here')); self.assertEqual(app.logs_destination(),-123)
             app.handle(self.msg(123,'/logs_off',False)); self.assertEqual(app.logs_destination(),-123)
@@ -37,5 +37,25 @@ class OpsTests(unittest.TestCase):
             app.set_logs_destination(None);self.assertIsNone(app.logs_destination())
     def test_test_message(self):
         app.set_logs_destination(-123)
-        with patch.object(app,'logs_allowed',return_value=True),patch.object(app,'send') as send:
+        with patch.object(app,'logs_check',return_value=None),patch.object(app,'send') as send:
             app.handle(self.msg(99,'/logs_test',False));self.assertEqual(send.call_args_list[0].args[0],-123)
+
+    def test_private_binding(self):
+        with patch.object(app,'logs_check',return_value=None),patch.object(app,'send'):
+            app.handle(self.msg(99,'/logs_here -1001234567890',False))
+            self.assertEqual(app.logs_destination(),-1001234567890)
+            app.handle(self.msg(123,'/logs_here -123',False))
+            self.assertEqual(app.logs_destination(),-1001234567890)
+    def test_anonymous_cannot_bind(self):
+        msg=self.msg(99,'/logs_here');msg['sender_chat']={'id':-123}
+        with patch.object(app,'logs_check',return_value=None),patch.object(app,'send') as send:
+            app.handle(msg);self.assertIsNone(app.logs_destination());send.assert_called_once()
+    def test_group_commands(self):
+        app.set_logs_destination(-123)
+        with patch.object(app,'logs_check',return_value=None),patch.object(app,'send') as send:
+            app.handle(self.msg(99,'/logs_test@mybot'));self.assertIn('Проверка служебных логов',send.call_args_list[0].args[1])
+            app.handle(self.msg(99,'/logs_status'));self.assertIn('подключена',send.call_args.args[1])
+            app.handle(self.msg(99,'/logs_off'));self.assertIsNone(app.logs_destination())
+    def test_failure_reason(self):
+        with patch.object(app,'logs_check',return_value='Добавь бота администратором группы.'),patch.object(app,'send') as send:
+            app.handle(self.msg(99,'/logs_here'));self.assertIsNone(app.logs_destination());self.assertIn('администратором',send.call_args.args[1])

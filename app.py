@@ -66,14 +66,26 @@ def logs_destination():
     value=os.environ.get('LOG_CHAT_ID','').strip()
     return int(value) if re.fullmatch(r'-[0-9]{1,19}',value) else None
 
-def logs_allowed(chat_id):
+def logs_check(chat_id):
+    if type(chat_id) is not int or chat_id >= 0:
+        return 'Укажи числовой отрицательный ID приватной группы.'
     try:
-        if type(chat_id) is not int or chat_id >= 0:return False
         chat=api('getChat',chat_id=chat_id)
-        if chat.get('type') not in ('group','supergroup') or chat.get('username') or chat.get('active_usernames'):return False
+        if chat.get('type') not in ('group','supergroup'):
+            return 'Нужна группа, а не канал или личный чат.'
+        if chat.get('username') or chat.get('active_usernames'):
+            return 'Служебная группа должна быть приватной.'
         bot=api('getMe')['id']
-        return any(api('getChatMember',chat_id=chat_id,user_id=uid).get('status')=='creator' for uid in ADMIN_IDS) and api('getChatMember',chat_id=chat_id,user_id=bot).get('status') in ('administrator','creator')
-    except Exception:return False
+        if api('getChatMember',chat_id=chat_id,user_id=bot).get('status') not in ('administrator','creator'):
+            return 'Добавь бота администратором группы.'
+        if not any(api('getChatMember',chat_id=chat_id,user_id=uid).get('status')=='creator' for uid in ADMIN_IDS):
+            return 'Группа должна принадлежать владельцу Gift Radar.'
+    except Exception:
+        return 'Telegram не подтвердил доступ к группе. Проверь ID, добавление бота и его права.'
+    return None
+
+def logs_allowed(chat_id):
+    return logs_check(chat_id) is None
 
 def set_logs_destination(chat_id):
     with db() as c:c.execute('INSERT OR REPLACE INTO ops_destination VALUES(1,?)',(chat_id or 0,))
@@ -118,7 +130,7 @@ def new_ticket(uid,kind,body):
         if c.execute('SELECT COUNT(*) FROM tickets WHERE uid=? AND created>?',(uid,int(time.time())-3600)).fetchone()[0]>=5: raise ValueError('Не более 5 обращений в час')
         tid=c.execute('INSERT INTO tickets(uid,kind,body,created) VALUES(?,?,?,?)',(uid,kind,body.strip(),int(time.time()))).lastrowid
     for admin in ADMIN_IDS:
-        try: send(admin,f'Обращение #{tid} ({kind})\n{body.strip()}\n\nОтвет: /reply {tid} текст')
+        try: send(admin,f'Новое обращение #{tid}. Открой панель управления, чтобы ответить.',{'inline_keyboard':[[{'text':'Открыть админ-панель','web_app':{'url':URL+'/admin'}}]]} if URL.startswith('https://') else None)
         except Exception: logging.warning('Support notification failed')
     return tid
 
@@ -427,11 +439,92 @@ def callback(q):
 def public_config():
     return {**read_config(),'group_url':GROUP_URL,'partner_requests':True}
 
+ADMIN_FIELDS = {'title':64,'banner':240,'welcome':500,'button_text':48,'access_text':500,'support':33}
+
+def admin_action(uid,data):
+    # Never trust an administrator flag or user ID sent by the browser.
+    if uid not in ADMIN_IDS: raise PermissionError('Нет доступа')
+    action=data.get('action')
+    if action=='overview':
+        with db() as c:
+            counts={k:c.execute(q).fetchone()[0] for k,q in {
+                'open_tickets':'SELECT COUNT(*) FROM tickets WHERE reply IS NULL',
+                'linked_groups':'SELECT COUNT(*) FROM delivery',
+                'seen_gifts':'SELECT COUNT(*) FROM seen_gifts',
+                'catalog':'SELECT COUNT(*) FROM lots WHERE updated>='+str(int(time.time())-86400)}.items()}
+        rows=partners.recent()
+        return {'config':read_config(),'counts':counts,'partners':rows,'log_chat':str(logs_destination() or ''),'market_enabled':see_enabled(uid),'mirror':MIRROR_MODE}
+    if action=='save':
+        values=data.get('config')
+        if not isinstance(values,dict) or not values or set(values)-set(ADMIN_FIELDS)-{'banner_enabled'}:raise ValueError('Некорректные настройки.')
+        validated={}
+        for key,value in values.items():
+            if key=='banner_enabled':
+                if type(value) is not bool:raise ValueError('Некорректный статус баннера.')
+            else:
+                if not isinstance(value,str):raise ValueError('Нужен текст.')
+                value=value.strip()
+                if key=='support':
+                    if value and not re.fullmatch(r'@[A-Za-z0-9_]{5,32}',value):raise ValueError('Укажи @username поддержки или оставь поле пустым.')
+                elif not 1<=len(value)<=ADMIN_FIELDS[key]:raise ValueError(f'{key}: от 1 до {ADMIN_FIELDS[key]} символов.')
+            validated[key]=value
+        with lock:
+            for key,value in validated.items():change(key,value)
+        warning=None
+        if 'button_text' in validated and TOKEN:
+            try:api('setChatMenuButton',menu_button={'type':'web_app','text':validated['button_text'],'web_app':{'url':URL+'/'}})
+            except Exception:warning='Настройки сохранены, но Telegram не обновил кнопку меню.'
+        return {'config':read_config(),'warning':warning}
+    if action=='quota':
+        if not see_enabled(uid):raise ValueError('Рыночный API недоступен в этом экземпляре.')
+        return {'remaining':see_api.client.quota()}
+    if action=='tickets':
+        with db() as c:return {'tickets':[dict(r) for r in c.execute('SELECT id,kind,body,created,reply,replied FROM tickets ORDER BY id DESC LIMIT 50')]}
+    if action=='reply':
+        tid=data.get('id');reply=data.get('reply')
+        if type(tid) is not int or tid<=0 or not isinstance(reply,str):raise ValueError('Некорректный ответ.')
+        return {'delivered':answer_ticket(tid,reply.strip())}
+    if action=='partner_review':
+        rid=data.get('id');status=data.get('status')
+        if type(rid) is not int or rid<=0 or not isinstance(status,str):raise ValueError('Некорректная заявка.')
+        row=partners.review(rid,status)
+        return {'request':row,'note':'Обновлён только статус. Развёртывание и остановка выполняются вручную на хостинге.'}
+    if action=='logs_bind':
+        raw=data.get('chat_id')
+        if not isinstance(raw,str) or not re.fullmatch(r'-[0-9]{1,19}',raw.strip()):raise ValueError('Укажи отрицательный ID группы.')
+        dest=int(raw.strip())
+        reason=logs_check(dest)
+        if reason:raise ValueError(reason)
+        set_logs_destination(dest);return {'log_chat':str(dest)}
+    if action=='logs_off':
+        set_logs_destination(None);return {'log_chat':''}
+    if action=='logs_test':
+        dest=logs_destination()
+        if not dest:raise ValueError('Сначала подключи группу.')
+        reason=logs_check(dest)
+        if reason:raise ValueError(reason)
+        send(dest,'✦ GIFT RADAR | SYSTEM\n✅ Проверка служебных логов');return {'sent':True}
+    if action=='catalog':
+        with db() as c:return {'lots':[dict(r) for r in c.execute('SELECT slug,price_milli,updated FROM lots ORDER BY updated DESC LIMIT 50')]}
+    if action in ('lot_add','lot_remove'):
+        slug=data.get('slug')
+        if not isinstance(slug,str) or not re.fullmatch(r'[A-Za-z]+-[1-9][0-9]{0,8}',slug):raise ValueError('Некорректный идентификатор подарка.')
+        if action=='lot_add':
+            amount=data.get('price')
+            if not isinstance(amount,str) or len(amount)>20:raise ValueError('Некорректная цена.')
+            set_lot(slug,amount)
+        else:
+            with db() as c:c.execute('DELETE FROM lots WHERE slug=?',(slug,))
+        return {'saved':True}
+    raise ValueError('Неизвестное действие.')
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path=urlsplit(self.path).path
         if path in ('/','/index.html'):
             data=(ROOT/'index.html').read_bytes();typ='text/html; charset=utf-8'
+        elif path in ('/admin','/admin.html'):
+            data=(ROOT/'admin.html').read_bytes();typ='text/html; charset=utf-8'
         elif path=='/api/config':
             data=json.dumps(public_config(),ensure_ascii=False).encode();typ='application/json; charset=utf-8'
         elif path=='/health':
@@ -443,7 +536,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def do_POST(self):
         path=urlsplit(self.path).path
-        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices','/api/delivery','/api/gift','/api/partner'): self.json_response(404,{'error':'Не найдено'});return
+        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices','/api/delivery','/api/gift','/api/partner','/api/admin'): self.json_response(404,{'error':'Не найдено'});return
         try:
             length=int(self.headers.get('Content-Length','0'))
             if not 0<length<=32768: raise ValueError('Недопустимый размер запроса')
@@ -453,7 +546,10 @@ class Handler(BaseHTTPRequestHandler):
         try: uid=verify_init(data.get('initData'))
         except (ValueError,TypeError,KeyError): self.json_response(401,{'error':'Открой Mini App заново в Telegram'});return
         try:
-            if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'see_enabled':see_enabled(uid),'search_count':preferred_count(uid),'delivery':destination(uid),**membership(uid)}
+            if path=='/api/admin':
+                if uid not in ADMIN_IDS:self.json_response(403,{'error':'Нет доступа'});return
+                result=admin_action(uid,data)
+            elif path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'see_enabled':see_enabled(uid),'search_count':preferred_count(uid),'delivery':destination(uid),**membership(uid)}
             elif path=='/api/partner':
                 if not membership(uid)['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft.'});return
@@ -507,13 +603,45 @@ OPTIONS={'🔐 Текст подписки':('access_text','Введи текс�
 def summary():
     c=read_config()
     return f"Название: {c['title']}\nБаннер: {c['banner']}\nПоддержка: {c['support'] or 'не задана'}\nДоступ: бесплатный\nКанал: {GROUP_ID}\nТекст подписки: {c['access_text']}"
+def handle_logs_command(msg,command,text):
+    chat=msg.get('chat',{}); uid=msg.get('from',{}).get('id'); cid=chat.get('id')
+    group=chat.get('type') in ('group','supergroup')
+    if not group and chat.get('type')!='private':return
+    if group and msg.get('sender_chat'):
+        # A message on behalf of a chat cannot authenticate the human admin.
+        if command=='/logs_here':send(cid,'Отправь команду от своего личного аккаунта (выключи анонимность администратора) или подключи группу по ID в личном чате с ботом.')
+        return
+    if uid not in ADMIN_IDS or msg.get('from',{}).get('is_bot'):return
+    if command=='/logs_here':
+        if group:dest=cid
+        else:
+            raw=text.split(maxsplit=1)
+            if len(raw)!=2 or not re.fullmatch(r'-[0-9]{1,19}',raw[1].strip()):
+                send(cid,'В приватной группе отправь /logs_here или в личном чате: /logs_here -1001234567890 (замени пример на ID своей группы).');return
+            dest=int(raw[1].strip())
+        reason=logs_check(dest)
+        if reason:send(cid,reason);return
+        set_logs_destination(dest)
+        send(cid,'✅ Служебные логи подключены. Только технические события.')
+        logging.info('Operational log destination configured')
+        return
+    if command=='/logs_off':
+        set_logs_destination(None);send(cid,'Служебные логи отключены.');return
+    dest=logs_destination()
+    if not dest:send(cid,'Логи не подключены. В приватной группе отправь /logs_here или укажи её ID в личном чате.');return
+    reason=logs_check(dest)
+    if reason:send(cid,reason);return
+    if command=='/logs_test':
+        try:send(dest,'✦ GIFT RADAR | SYSTEM\n✅ Проверка служебных логов')
+        except Exception:send(cid,'Не удалось отправить тестовое сообщение. Проверь право бота отправлять сообщения.');return
+        send(cid,'Тестовое сообщение отправлено.')
+    else:send(cid,f'Служебная группа подключена: {dest}')
+
 def handle(msg):
-    chat=msg.get('chat',{});uid=msg.get('from',{}).get('id');text=msg.get('text','').strip();command=text.split()[0].split('@')[0] if text else ''
+    chat=msg.get('chat',{});uid=msg.get('from',{}).get('id');text=msg.get('text','').strip();command=text.split()[0].split('@')[0].lower() if text else ''
+    if command in ('/logs_here','/logs_status','/logs_off','/logs_test'):
+        handle_logs_command(msg,command,text);return
     if chat.get('type') in ('group','supergroup'):
-        if command=='/logs_here':
-            if uid not in ADMIN_IDS or msg.get('sender_chat') or msg.get('from',{}).get('is_bot'):return
-            if not logs_allowed(chat['id']):send(chat['id'],'Нужна отдельная приватная группа, созданная владельцем Gift Radar. Добавь бота администратором.');return
-            set_logs_destination(chat['id']);send(chat['id'],'✅ Служебные логи подключены. Только технические события.');return
         if command=='/connect' and uid and not msg.get('sender_chat') and not msg.get('from',{}).get('is_bot'):
             try:
                 connect_group(uid,chat,text.partition(' ')[2].strip());send(chat['id'],'✅ Группа подключена. Новые подборки будут приходить сюда.')
@@ -525,17 +653,6 @@ def handle(msg):
         return
     if chat.get('type')!='private':return
     chat=chat['id']
-    if command in ('/logs_status','/logs_off','/logs_test'):
-        if uid not in ADMIN_IDS:return
-        if command=='/logs_off':set_logs_destination(None);send(chat,'Служебные логи отключены.');return
-        dest=logs_destination()
-        if not dest:send(chat,'Логи не подключены. Создай приватную группу и отправь /logs_here.');return
-        if not logs_allowed(dest):send(chat,'Служебная группа недоступна или права изменились.');return
-        if command=='/logs_test':
-            try:send(dest,'✦ GIFT RADAR | SYSTEM\n✅ Проверка служебных логов');send(chat,'Тестовое сообщение отправлено.')
-            except Exception:send(chat,'Не удалось отправить тестовое сообщение.')
-        else:send(chat,f'Служебная группа подключена: {dest}')
-        return
     if command=='/start':
         pending.pop(uid,None);home(chat) if gate(chat,uid) else None;return
     if command=='/mirror':
@@ -614,16 +731,20 @@ def handle(msg):
         return
     if text=='📥 Обращения' or command=='/tickets':
         with db() as c: rows=c.execute('SELECT id,kind,body FROM tickets WHERE reply IS NULL ORDER BY id DESC LIMIT 10').fetchall()
-        if not rows:send(chat,'Нет открытых обращений.',MENU)
+        if not rows:send(chat,'Нет открытых обращений.',{'remove_keyboard':True})
         for r in rows:send(chat,f"#{r['id']} · {r['kind']}\n{r['body']}\n/reply {r['id']} текст")
         return
-    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением\nРыночные данные (тест владельца): /quota; /gift PlushPepe-1\nКаталог V7: /lot slug цена_TON; /unlot slug\nПартнёры: /partners; /partnerapprove ID; /partnerreject ID; /partneractive ID; /partnerdisable ID\nЛоги: /logs_status; /logs_test; /logs_off. В приватной группе: /logs_here',MENU);return
-    if command=='/cancel' or text=='Отмена':pending.pop(uid,None);send(chat,'Изменение отменено.',MENU);return
+    if command=='/admin':
+        pending.pop(uid,None)
+        send(chat,'✦ Gift Radar · Управление',{'remove_keyboard':True})
+        send(chat,'Открой отдельную панель администратора.',{'inline_keyboard':[[{'text':'⚙️ Открыть админ-панель','web_app':{'url':URL+'/admin'}}]]})
+        return
+    if command=='/cancel' or text=='Отмена':pending.pop(uid,None);send(chat,'Изменение отменено.',{'remove_keyboard':True});return
     if text in OPTIONS:
         key,prompt=OPTIONS[text];pending[uid]=key;send(chat,prompt,{'keyboard':[[{'text':'Отмена'}]],'resize_keyboard':True});return
-    if text=='📋 Текущие настройки':pending.pop(uid,None);send(chat,summary(),MENU);return
+    if text=='📋 Текущие настройки':pending.pop(uid,None);send(chat,summary(),{'remove_keyboard':True});return
     if text=='👁 Показать / скрыть баннер':
-        pending.pop(uid,None);c=change('banner_enabled',not read_config()['banner_enabled']);send(chat,'Баннер '+('показан' if c['banner_enabled'] else 'скрыт')+'.',MENU);return
+        pending.pop(uid,None);c=change('banner_enabled',not read_config()['banner_enabled']);send(chat,'Баннер '+('показан' if c['banner_enabled'] else 'скрыт')+'.',{'remove_keyboard':True});return
     key=pending.get(uid)
     if not key:return
     try:
@@ -640,7 +761,7 @@ def handle(msg):
             try:api('setChatMenuButton',menu_button={'type':'web_app','text':value,'web_app':{'url':URL+'/'}})
             except Exception:logging.warning('Menu button update failed')
     except ValueError as e:send(chat,'Не сохранено: '+str(e));return
-    pending.pop(uid,None);send(chat,'✅ Сохранено. Mini App обновит настройки автоматически.',MENU)
+    pending.pop(uid,None);send(chat,'✅ Сохранено. Mini App обновит настройки автоматически.',{'remove_keyboard':True})
 
 def bot_loop():
     offset=None
