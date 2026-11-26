@@ -32,7 +32,7 @@ jobs:
           token = os.environ.get("SEE_API_KEY", "").strip()
 
           if not token:
-              sys.exit("SEE_API_KEY is missing")
+              sys.exit("SEE_API_KEY missing")
 
           opener = build_opener(NoRedirect())
 
@@ -51,17 +51,13 @@ jobs:
                       print(path, "HTTP:", response.status)
                       data = json.load(response)
 
-                      if data.get("ok") is not True:
+                      if not isinstance(data, dict) or data.get("ok") is not True:
                           sys.exit("Unexpected API response")
 
-                      for key in (
-                          "X-Free-Remaining",
-                          "X-Request-Cost",
-                          "X-Balance"
-                      ):
-                          value = response.headers.get(key)
-                          if value is not None:
-                              print(key, value)
+                      print("Free remaining:",
+                            response.headers.get("X-Free-Remaining"))
+                      print("Request cost:",
+                            response.headers.get("X-Request-Cost"))
 
                       return data.get("result"), response.headers
 
@@ -73,32 +69,37 @@ jobs:
               except (URLError, TimeoutError, ValueError):
                   sys.exit("Network or response error")
 
-          print("Checking authorization")
-          request("ping")
-          time.sleep(1.2)
-
-          print("Checking quota")
-          _, headers = request("me")
-
-          remaining = headers.get("X-Free-Remaining", "0")
+          print("Checking new token")
+          _, headers = request("ping")
 
           try:
-              free = int(remaining)
+              remaining = int(headers.get("X-Free-Remaining", "0"))
           except ValueError:
-              free = 0
+              remaining = 0
 
-          if free < 1:
-              sys.exit("Free quota not confirmed. Gift request skipped.")
+          if remaining < 1:
+              sys.exit("Free quota unavailable. Search skipped.")
 
           time.sleep(1.2)
 
-          print("Checking real NFT")
-          gift, _ = request("gift/PlushPepe-1")
+          print("Checking gift search")
+          result, _ = request("gifts?limit=5")
 
-          if isinstance(gift, dict):
-              for key in ("slug", "title", "num", "model", "backdrop", "pattern"):
-                  if key in gift:
-                      print(key, json.dumps(gift[key], ensure_ascii=False))
+          if isinstance(result, dict):
+              print("Result fields:", list(result.keys()))
 
-          print("NFT request successful")
+              for key, value in result.items():
+                  if isinstance(value, list):
+                      print("List:", key, "Count:", len(value))
+
+                      if value and isinstance(value[0], dict):
+                          print("Item fields:", list(value[0].keys()))
+
+          elif isinstance(result, list):
+              print("Items:", len(result))
+
+              if result and isinstance(result[0], dict):
+                  print("Item fields:", list(result[0].keys()))
+
+          print("Gift search request successful")
           PY
