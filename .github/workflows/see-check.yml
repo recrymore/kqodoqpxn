@@ -33,12 +33,14 @@ jobs:
               sys.exit("SEE_API_KEY is missing")
 
           print("SEE_API_KEY: configured")
+          print("Application: GiftRadar/1.0")
 
           req = Request(
               "https://kartoshka.free/v1/ping",
               headers={
                   "Authorization": "Bearer " + token,
-                  "Accept": "application/json"
+                  "Accept": "application/json",
+                  "User-Agent": "GiftRadar/1.0"
               }
           )
 
@@ -46,14 +48,17 @@ jobs:
               with build_opener(NoRedirect()).open(req, timeout=20) as response:
                   print("HTTP status:", response.status)
                   data = json.load(response)
-                  print("API OK:", data.get("ok") is True)
+
+                  if data.get("ok") is not True:
+                      sys.exit("Unexpected API response")
+
+                  print("API authorization: OK")
+                  print("See API connection successful")
 
           except HTTPError as exc:
               print("HTTP status:", exc.code)
               print("Server:", exc.headers.get("Server"))
               print("CF-Ray:", exc.headers.get("CF-Ray"))
-              print("CF-Error-Type:", exc.headers.get("CF-Error-Type"))
-              print("CF-Error-Origin:", exc.headers.get("CF-Error-Origin"))
 
               try:
                   data = json.loads(exc.read(8192))
@@ -67,6 +72,6 @@ jobs:
 
               sys.exit(1)
 
-          except URLError:
-              sys.exit("Network error")
+          except (URLError, TimeoutError, ValueError):
+              sys.exit("Network or response error")
           PY
