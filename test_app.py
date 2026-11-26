@@ -77,7 +77,7 @@ class Tests(unittest.TestCase):
         with patch.object(app,'api'),patch.object(app,'membership',return_value={'member':False}),patch.object(app,'send'),patch.object(app,'random_gifts') as f:
             app.callback(q);f.assert_not_called()
         with patch.object(app,'api'),patch.object(app,'membership',return_value={'member':True}),patch.object(app,'send'),patch.object(app,'random_gifts',return_value=[]) as f:
-            app.callback(q);f.assert_called_once_with(3)
+            app.callback(q);f.assert_called_once_with(gifts.MAX_BATCH)
     def card(self):
         return {'slug':'PlushPepe-123','name':'Plush Pepe','number':123,'url':'https://t.me/nft/PlushPepe-123','model':'Steel','backdrop':'Black','symbol':'Star'}
     def test_delivery_private(self):
@@ -93,7 +93,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(app.destination(456)['kind'],'private')
             with patch.object(app,'send') as send:
                 self.assertEqual(app.deliver_gifts(123,[self.card()],'random')['kind'],'group');send.assert_called_once();self.assertEqual(send.call_args.args[0],-100123)
-                self.assertTrue(all('url' in b for r in send.call_args.args[2]['inline_keyboard'] for b in r))
+                self.assertTrue(all('url' in b or 'copy_text' in b for r in send.call_args.args[2]['inline_keyboard'] for b in r))
         with patch.object(app,'membership',return_value={'member':True}),patch.object(app,'group_allowed',return_value=False),patch.object(app,'send') as send:
             self.assertTrue(app.deliver_gifts(123,[self.card()],'random')['fallback']);send.assert_called_once();self.assertEqual(send.call_args.args[0],123)
         self.assertEqual(app.private_destination(123)['kind'],'private')
@@ -113,4 +113,25 @@ class Tests(unittest.TestCase):
     def test_delivery_blocked(self):
         with patch.object(app,'membership',return_value={'member':False}),patch.object(app,'send') as send:
             self.assertEqual(app.deliver_gifts(123,[self.card()],'random')['kind'],'blocked');send.assert_not_called()
+    def test_larger_batch(self):
+        with patch.object(gifts,'_last_job',0),patch.object(gifts.random,'choice',return_value='PlushPepe'),patch.object(gifts.random,'randint',side_effect=range(1,11)),patch.object(gifts,'fetch_card',side_effect=lambda slug:{**self.card(),'slug':slug}):
+            result=gifts.random_gifts(10)
+            self.assertEqual(len(result),10)
+            self.assertEqual(len({g['slug'] for g in result}),10)
+        with self.assertRaises(ValueError):gifts.random_gifts(11)
+    def test_partial_batch(self):
+        with patch.object(gifts,'_last_job',0),patch.object(gifts.random,'choice',return_value='PlushPepe'),patch.object(gifts.random,'randint',side_effect=[1,2]),patch.object(gifts,'fetch_card',side_effect=[self.card(),gifts.GiftError('limit')]) as fetch:
+            self.assertEqual(len(gifts.random_gifts(10)),1)
+            self.assertEqual(fetch.call_count,2)
+    def test_large_pack_fits_telegram(self):
+        card={**self.card(),'model':'X'*160,'backdrop':'Y'*160,'symbol':'Z'*160}
+        text,rows=app.gift_pack([card]*10,'random')
+        self.assertLess(len(text.encode('utf-16-le'))//2,4096)
+        self.assertEqual(len(rows),10)
+    def test_gift_actions(self):
+        _,rows=app.gift_pack([self.card()],'random')
+        buttons=app.ik(rows)['inline_keyboard'][0]
+        self.assertEqual(buttons[0]['url'],self.card()['url'])
+        self.assertEqual(buttons[1]['copy_text']['text'],self.card()['url'])
+        self.assertNotIn('callback_data',buttons[1])
 if __name__=='__main__':unittest.main()

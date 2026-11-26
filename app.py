@@ -2,7 +2,7 @@
 import copy, json, os, re, threading, time, logging, hmac, hashlib, sqlite3, secrets
 from contextlib import contextmanager
 from urllib.error import HTTPError
-from gifts import random_gifts, GiftError, COLLECTIONS, validate_filters, matches, fetch_card
+from gifts import random_gifts, GiftError, COLLECTIONS, validate_filters, matches, fetch_card, MAX_BATCH
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -102,7 +102,7 @@ def price_gifts(mode):
     if mode not in PRICE_MODES:raise ValueError('Неизвестный диапазон.')
     low,high=PRICE_MODES[mode]
     with db() as c:
-        rows=c.execute('SELECT * FROM lots WHERE price_milli>=? AND price_milli<? AND updated>=? ORDER BY RANDOM() LIMIT 9',(low,high,int(time.time())-86400)).fetchall()
+        rows=c.execute('SELECT * FROM lots WHERE price_milli>=? AND price_milli<? AND updated>=? ORDER BY RANDOM() LIMIT ?',(low,high,int(time.time())-86400,MAX_BATCH)).fetchall()
     return [{**json.loads(r['card']),'price_ton':r['price_milli']/1000,'price_source':'admin','updated':r['updated']} for r in rows]
 
 def set_lot(slug,amount):
@@ -163,7 +163,11 @@ def link_instructions(uid):
     username=api('getMe')['username']
     return f'Создай свою группу, добавь @{username} администратором. Затем отправь в группе от своего имени:\n/connect@{username} {code}\n\nКод действует 10 минут и только для твоего аккаунта.'
 
-def ik(rows):return {'inline_keyboard':[[{'text':label,**({'url':value} if value.startswith('https://') else {'callback_data':value})} for label,value in row] for row in rows]}
+def ik(rows):
+    def button(label,value):
+        if isinstance(value,dict):return {'text':label,**value}
+        return {'text':label,**({'url':value} if value.startswith('https://') else {'callback_data':value})}
+    return {'inline_keyboard':[[button(label,value) for label,value in row] for row in rows]}
 def home(chat):
     c=read_config();send(chat,c['title']+'\n'+c['welcome'],{'inline_keyboard':[[{'text':'🎲 Случайные подарки','callback_data':'random'},{'text':'💎 По цене','callback_data':'prices'}],[{'text':'🎛 Фильтры','callback_data':'filters'}],[{'text':'📦 Куда присылать NFT','callback_data':'delivery'}],[{'text':c['button_text'],'web_app':{'url':URL+'/'}}]]})
 def gate(chat,uid):
@@ -177,9 +181,12 @@ def gift_pack(items,mode):
     title=f'✦ GIFT RADAR | ПОДБОРКА\n━━━━━━━━━━━━━━\n🔎 Найдено подарков: {len(items)} шт.'
     if mode in PRICE_MODES:title+='\nЦены из каталога администратора; проверь на площадке.'
     if not items:title+='\nСовпадений пока нет. Попробуй другой запрос.'
+    def short(value):
+        value=str(value)
+        return value if len(value)<=60 else value[:59]+'…'
     for i,g in enumerate(items,1):
-        title+=f"\n\n{i:02d} · {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+f"\n{g['model']} · {g['backdrop']} · {g['symbol']}"
-    rows=[[(f"{i}. Открыть NFT",g['url'])] for i,g in enumerate(items,1)]
+        title+=f"\n\n{i:02d} ┃ {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+f"\n{short(g['model'])} · {short(g['backdrop'])} · {short(g['symbol'])}"
+    rows=[[(f"{i:02d} · Владелец / NFT",g['url']),("Копировать ссылку",{'copy_text':{'text':g['url']}})] for i,g in enumerate(items,1)]
     return title,rows
 
 def deliver_gifts(uid,items,mode):
@@ -192,7 +199,7 @@ def deliver_gifts(uid,items,mode):
     if d['kind']=='group':
         try:
             if not group_allowed(uid,d['chat_id']):raise ValueError('Группа недоступна')
-            # Group gets only gift URL buttons, no user-specific actions.
+            # Group gets only gift URL and clipboard buttons, no user-specific actions.
             send(d['chat_id'],title,ik(rows))
         except Exception:
             title+='\n\n⚠️ Не удалось подтвердить доставку в группу. Подборка отправлена сюда.'
@@ -222,7 +229,7 @@ def callback(q):
     elif action=='prices':send(chat,'💎 Выбери бюджет в TON.\nДо 5 · 5–20 · 20–999.999',ik([[('До 5','low'),('5–20','mid')],[('20+','high'),('Все цены','all')],[('← Меню','home')]]))
     elif action=='filters':send(chat,'🎛 Фильтры по атрибутам\nВведи, например: /find model=Steel; backdrop=Black; symbol=Star\nКоллекции: '+', '.join(COLLECTIONS)+'\nЛюбое поле можно пропустить.',ik([[('← Меню','home')]]))
     elif action=='random' or action in PRICE_MODES:
-        try:show_gifts(chat,random_gifts(3) if action=='random' else price_gifts(action),action)
+        try:show_gifts(chat,random_gifts(MAX_BATCH) if action=='random' else price_gifts(action),action)
         except GiftError as e:send(chat,str(e))
 
 def public_config():
@@ -266,7 +273,7 @@ class Handler(BaseHTTPRequestHandler):
                 status=membership(uid)
                 if not status['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft или повтори проверку подписки.','reason':status['reason']});return
-                result={'gifts':price_gifts(data.get('mode','all')) if path=='/api/prices' else (random_gifts(data.get('count',3),data['filters']) if 'filters' in data else random_gifts(data.get('count',3)))}
+                result={'gifts':price_gifts(data.get('mode','all')) if path=='/api/prices' else (random_gifts(data.get('count',MAX_BATCH),data['filters']) if 'filters' in data else random_gifts(data.get('count',MAX_BATCH)))}
                 result['delivery']=deliver_gifts(uid,result['gifts'],data.get('mode','all') if path=='/api/prices' else ('filters' if 'filters' in data else 'random'))
                 if result['delivery']['kind']=='blocked':
                     self.json_response(403,{'error':'Подписка не подтверждена.'});return
@@ -319,7 +326,7 @@ def handle(msg):
         if not gate(chat,uid):return
         try:
             raw=text.partition(' ')[2];filters=validate_filters(dict(tuple(x.strip().split('=',1)) for x in raw.split(';') if x.strip()))
-            show_gifts(chat,random_gifts(3,filters),'filters')
+            show_gifts(chat,random_gifts(MAX_BATCH,filters),'filters')
         except (ValueError,GiftError) as e:send(chat,'Ошибка поиска: '+str(e))
         return
     if uid not in ADMIN_IDS:return

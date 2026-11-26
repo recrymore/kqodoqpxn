@@ -55,19 +55,26 @@ def fetch_card(slug):
         if len(_cache)>=500:_cache.pop(next(iter(_cache)))
         _cache[slug]=(time.monotonic(),item);return item
 
+MAX_BATCH=10
 _job=threading.Lock();_last_job=0.
 def random_gifts(count, filters=None):
     global _last_job
-    if type(count) is not int or not 1<=count<=3:raise ValueError('Выбери от 1 до 3 подарков.')
+    if type(count) is not int or not 1<=count<=MAX_BATCH:raise ValueError(f'Выбери от 1 до {MAX_BATCH} подарков.')
     filters=validate_filters(filters)
     if not _job.acquire(blocking=False):raise GiftError('Подборка уже выполняется. Попробуй чуть позже.')
     try:
         if time.monotonic()-_last_job<10 and _last_job:raise GiftError('Подожди несколько секунд перед новой подборкой.')
         _last_job=time.monotonic();results=[];seen=set()
-        for _ in range(min(8,count+5) if filters else count+2):
+        deadline=time.monotonic()+40
+        for _ in range(min(20,count+8) if filters else min(20,count+5)):
+            if time.monotonic()>=deadline:break
             collection=filters.get('collection') or random.choice(list(COLLECTIONS));slug=f'{collection}-{random.randint(1,COLLECTIONS[collection][1])}'
             if slug in seen:continue
-            seen.add(slug);item=fetch_card(slug)
+            seen.add(slug)
+            try:item=fetch_card(slug)
+            except GiftError:
+                if results:break
+                raise
             if item and matches(item,filters):results.append(item)
             if len(results)==count:break
         if not results and not filters:raise GiftError('Не удалось получить карточки. Попробуй позже.')
