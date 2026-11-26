@@ -20,6 +20,8 @@ jobs:
           import os
           import sys
           import json
+          import time
+
           from urllib.request import Request, build_opener, HTTPRedirectHandler
           from urllib.error import HTTPError, URLError
 
@@ -32,46 +34,71 @@ jobs:
           if not token:
               sys.exit("SEE_API_KEY is missing")
 
-          print("SEE_API_KEY: configured")
-          print("Application: GiftRadar/1.0")
+          opener = build_opener(NoRedirect())
 
-          req = Request(
-              "https://kartoshka.free/v1/ping",
-              headers={
-                  "Authorization": "Bearer " + token,
-                  "Accept": "application/json",
-                  "User-Agent": "GiftRadar/1.0"
-              }
-          )
-
-          try:
-              with build_opener(NoRedirect()).open(req, timeout=20) as response:
-                  print("HTTP status:", response.status)
-                  data = json.load(response)
-
-                  if data.get("ok") is not True:
-                      sys.exit("Unexpected API response")
-
-                  print("API authorization: OK")
-                  print("See API connection successful")
-
-          except HTTPError as exc:
-              print("HTTP status:", exc.code)
-              print("Server:", exc.headers.get("Server"))
-              print("CF-Ray:", exc.headers.get("CF-Ray"))
+          def request(path):
+              req = Request(
+                  "https://kartoshka.free/v1/" + path,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/json",
+                      "User-Agent": "GiftRadar/1.0"
+                  }
+              )
 
               try:
-                  data = json.loads(exc.read(8192))
-                  for key in ("error", "error_code", "code", "message", "detail"):
-                      value = data.get(key)
-                      if isinstance(value, (str, int)):
-                          safe = str(value).replace(token, "[REDACTED]")
-                          print(key + ":", repr(safe[:500]))
-              except Exception:
-                  print("No readable JSON error")
+                  with opener.open(req, timeout=25) as response:
+                      print(path, "HTTP:", response.status)
+                      data = json.load(response)
 
-              sys.exit(1)
+                      if data.get("ok") is not True:
+                          sys.exit("Unexpected API response")
 
-          except (URLError, TimeoutError, ValueError):
-              sys.exit("Network or response error")
+                      for key in (
+                          "X-Free-Remaining",
+                          "X-Request-Cost",
+                          "X-Balance"
+                      ):
+                          value = response.headers.get(key)
+                          if value is not None:
+                              print(key, value)
+
+                      return data.get("result"), response.headers
+
+              except HTTPError as exc:
+                  print("HTTP error:", exc.code)
+                  print("CF-Ray:", exc.headers.get("CF-Ray"))
+                  sys.exit(1)
+
+              except (URLError, TimeoutError, ValueError):
+                  sys.exit("Network or response error")
+
+          print("Checking authorization")
+          request("ping")
+          time.sleep(1.2)
+
+          print("Checking quota")
+          _, headers = request("me")
+
+          remaining = headers.get("X-Free-Remaining", "0")
+
+          try:
+              free = int(remaining)
+          except ValueError:
+              free = 0
+
+          if free < 1:
+              sys.exit("Free quota not confirmed. Gift request skipped.")
+
+          time.sleep(1.2)
+
+          print("Checking real NFT")
+          gift, _ = request("gift/PlushPepe-1")
+
+          if isinstance(gift, dict):
+              for key in ("slug", "title", "num", "model", "backdrop", "pattern"):
+                  if key in gift:
+                      print(key, json.dumps(gift[key], ensure_ascii=False))
+
+          print("NFT request successful")
           PY
