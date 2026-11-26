@@ -136,11 +136,16 @@ class Client:
         # Recheck quota every cache miss; no billable calls after quota is exhausted.
         self._request('ping')
         if self.remaining is None or self.remaining<1:raise GiftError('Бесплатная квота не подтверждена или закончилась. Запрос отменён.')
-    def search(self,count,filters=None,mode=None,*,exclude=None):
+    def search(self,count,filters=None,mode=None,*,exclude=None,number_window=None):
         if type(count) is not int or not 1<=count<=MAX_BATCH:raise ValueError('Количество: от 1 до 50.')
         filters=filters or {}
         if not isinstance(filters,dict) or set(filters)-{'collection','model','backdrop','symbol'}:raise ValueError('Некорректные фильтры.')
         params={'limit':100,'burned':'false'}
+        if number_window is not None:
+            lo,hi=number_window
+            if type(lo) is not int or type(hi) is not int or not 1<=lo<=hi<=1_000_000:
+                raise ValueError('Некорректный диапазон номеров.')
+            params.update(number_from=lo,number_to=hi,sort='number',order='asc')
         for k,v in filters.items():
             if not isinstance(v,str) or len(v)>100:raise ValueError('Некорректный фильтр.')
             if v.strip():params['pattern' if k=='symbol' else k]=v.strip()
@@ -182,6 +187,40 @@ class Client:
                 available=[g for g in items if g['slug'].casefold() not in excluded]
             else:log.info('gift cache hit available=%s',len(available))
             return random.sample(available,min(count,len(available)))
+    def search_spread(self,count,*,exclude=None):
+        """Private, bounded interactive sampling of gift attributes only.
+
+        Sample up to three number bands via documented filters, never by
+        constructing opaque cursors. Not a uniform sample of the entire market.
+        """
+        if type(count) is not int or not 1<=count<=MAX_BATCH:
+            raise ValueError('Количество: от 1 до 50.')
+        bands=[(1,999),(1000,99999),(100000,1000000)]
+        random.shuffle(bands)
+        seen={str(x).casefold() for x in (exclude or ())}
+        pools=[];error=None
+        with self.lock:
+            for low,high in bands:
+                # Leave space for a page; select a fresh start in this band.
+                start=random.randint(low,max(low,high-100))
+                try:
+                    page=self.search(count,exclude=seen,number_window=(start,high))
+                except GiftError as exc:
+                    error=exc;break
+                page=[g for g in page if start<=g['number']<=high and g['slug'].casefold() not in seen]
+                seen.update(g['slug'].casefold() for g in page)
+                pools.append(page)
+                if len(pools)>=min(count,3) and sum(map(len,pools))>=count:break
+            # Round-robin across number bands before taking more from a band.
+            result=[]
+            while len(result)<count and any(pools):
+                for pool in pools:
+                    if pool and len(result)<count:result.append(pool.pop())
+            if not result and error is not None:raise error
+            random.shuffle(result)
+            log.info('gift diverse sample bands=%s returned=%s',len(pools),len(result))
+            return result
+
     def single(self,slug):
         if not isinstance(slug,str) or not SLUG.fullmatch(slug):raise ValueError('Формат: /gift PlushPepe-1')
         with self.lock:

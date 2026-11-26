@@ -14,15 +14,15 @@ class HistoryTests(unittest.TestCase):
     def test_next_page_and_no_repeat(self):
         pages=[{'items':[raw(i) for i in range(1,5)],'nextCursor':'opaque-next'}, {'items':[raw(i) for i in range(4,9)]}]
         with patch.object(see_api,'client',self.c),patch.object(self.c,'_free'),patch.object(self.c,'_request',side_effect=pages) as req:
-            first=app.search_gifts(99,3)
-            second=app.search_gifts(99,3)
-            third=app.search_gifts(99,3)
+            first=app.search_gifts(99,3,filters={'collection':'PlushPepe'})
+            second=app.search_gifts(99,3,filters={'collection':'PlushPepe'})
+            third=app.search_gifts(99,3,filters={'collection':'PlushPepe'})
             self.assertEqual([len(x) for x in (first,second,third)],[3,3,2])
             slugs=[g['slug'] for g in first+second+third]
             self.assertEqual(len(set(slugs)),8)
             self.assertEqual(req.call_count,2)
             self.assertEqual(req.call_args.args[1]['cursor'],'opaque-next')
-            self.assertEqual(app.search_gifts(99,3),[])
+            self.assertEqual(app.search_gifts(99,3,filters={'collection':'PlushPepe'}),[])
             self.assertEqual(req.call_count,2)
             self.assertNotIn('example_owner',str(self.c.cache))
     def test_history_persists_and_is_private(self):

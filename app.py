@@ -139,7 +139,9 @@ def search_gifts(uid,count=None,filters=None,mode=None):
     with search_lock:
         set_count(uid,count)
         excluded=seen_gifts(uid)
-        if see_enabled(uid):items=see_api.client.search(count,filters,mode,exclude=excluded)
+        if see_enabled(uid):
+            if mode is None and (filters is None or filters=={}):items=see_api.client.search_spread(count,exclude=excluded)
+            else:items=see_api.client.search(count,filters,mode,exclude=excluded)
         elif mode is not None:items=price_gifts(mode,count,uid)
         else:
             args=(count,filters) if filters is not None else (count,)
@@ -251,10 +253,10 @@ def ensure_data_credit():
         logging.warning('Bot description attribution update failed')
         return False
 
-def gift_pack(items,mode,*,single_card=False):
+def gift_pack(items,mode,*,single_card=False,group_delivery=False):
     title=f'✦ GIFT RADAR | ПОДБОРКА\n━━━━━━━━━━━━━━\n🔎 Найдено подарков: {len(items)} шт.'
     if any(g.get('source')=='See.tg' for g in items):
-        title += '\nОценка не равна цене продажи.' if single_card and credit_in_description else '\n' + DATA_CREDIT + ' · оценка не равна цене продажи.'
+        title += '\nОценка не равна цене продажи.' if credit_in_description and not group_delivery else '\n' + DATA_CREDIT + ' · оценка не равна цене продажи.'
     elif mode in PRICE_MODES:title+='\nЦены из каталога администратора; проверь на площадке.'
     if not items:title+='\nНовых совпадений пока нет. Измени фильтры или попробуй следующую подборку. /resetseen — очистить свою историю.'
     def short(value):
@@ -262,8 +264,26 @@ def gift_pack(items,mode,*,single_card=False):
         return value if len(value)<=60 else value[:59]+'…'
     for i,g in enumerate(items,1):
         title+=f"\n\n{i:02d} ┃ {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+(f" · оценка {g['estimate_ton']:.2f} TON" if 'estimate_ton' in g else '')+f"\n{short(g['model'])} · {short(g['backdrop'])} · {short(g['symbol'])}"
-    rows=[[(f"{i:02d} · Владелец / NFT",g['url']),("Копировать ссылку",{'copy_text':{'text':g['url']}})] for i,g in enumerate(items,1)]
+    rows=[[(f"{i:02d} · Подарок",g['url']),("Копия",{'copy_text':{'text':g['url']}})] for i,g in enumerate(items,1)]
     return title,rows
+
+OWNER_MESSAGES={
+    'missing_owner':'данные владельца отсутствуют в ответе',
+    'hidden':'владелец скрыт',
+    'not_public':'API не подтверждает публичность владельца',
+    'other_owner_type':'другой тип владельца (не личный аккаунт)',
+    'missing_username':'публичный владелец, username не предоставлен',
+    'unrecognized':'формат данных владельца не распознан',
+    'conflicting_owner':'данные владельца противоречат друг другу',
+}
+
+def inspect_one(uid,ref):
+    if not see_enabled(uid):raise ValueError('Проверка одной карточки доступна владельцу бота при настроенном источнике данных.')
+    if not isinstance(ref,str):raise ValueError('Укажи ссылку или номер NFT.')
+    slug=ref.strip().removeprefix('https://t.me/nft/')
+    item=see_api.client.single(slug)
+    item['owner_display']=item.get('public_username',OWNER_MESSAGES.get(item.get('owner_status'),'не указан'))
+    return item
 
 def deliver_gifts(uid,items,mode):
     menu=[('🎛 Изменить фильтры' if mode=='filters' else '↻ Новая подборка',mode),('← Меню','home')]
@@ -278,7 +298,7 @@ def deliver_gifts(uid,items,mode):
     # Telegram text and keyboard limits: deliver bounded chunks, not one 50-item message.
     chunks=[items[i:i+10] for i in range(0,len(items),10)]
     for i,part in enumerate(chunks,1):
-        title,rows=gift_pack(part,mode)
+        title,rows=gift_pack(part,mode,group_delivery=group)
         if len(chunks)>1:title+=f'\n\nЧасть {i}/{len(chunks)} · всего {len(items)} NFT'
         if group:
             try:send(d['chat_id'],title,ik(rows));continue
@@ -341,7 +361,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def do_POST(self):
         path=urlsplit(self.path).path
-        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices','/api/delivery'): self.json_response(404,{'error':'Не найдено'});return
+        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices','/api/delivery','/api/gift'): self.json_response(404,{'error':'Не найдено'});return
         try:
             length=int(self.headers.get('Content-Length','0'))
             if not 0<length<=32768: raise ValueError('Недопустимый размер запроса')
@@ -352,6 +372,10 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,TypeError,KeyError): self.json_response(401,{'error':'Открой Mini App заново в Telegram'});return
         try:
             if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'see_enabled':see_enabled(uid),'search_count':preferred_count(uid),'delivery':destination(uid),**membership(uid)}
+            elif path=='/api/gift':
+                if not see_enabled(uid) or not membership(uid)['member']:
+                    self.json_response(403,{'error':'Проверка недоступна.'});return
+                result={'gift':inspect_one(uid,data.get('ref'))}
             elif path=='/api/delivery':
                 if not membership(uid)['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft.'});return
@@ -384,7 +408,7 @@ def api(method,**kwargs):
     return out['result']
 
 def send(chat,text,markup=None):
-    kw={'chat_id':chat,'text':text}
+    kw={'chat_id':chat,'text':text,'link_preview_options':{'is_disabled':True}}
     if markup:kw['reply_markup']=markup
     return api('sendMessage',**kw)
 MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'👁 Показать / скрыть баннер'}],[{'text':'🏷 Название'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'🔐 Текст подписки'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'📊 Лимит запросов'},{'text':'Отмена'}]],'resize_keyboard':True}
@@ -435,19 +459,12 @@ def handle(msg):
     if command=='/gift':
         if not gate(chat,uid):return
         try:
-            slug=text.partition(' ')[2].strip().removeprefix('https://t.me/nft/')
-            item=see_api.client.single(slug)
+            item=inspect_one(uid,text.partition(' ')[2])
             title,rows=gift_pack([item],'random',single_card=True)
-            owner_messages={
-                'missing_owner':'данные владельца отсутствуют в ответе',
-                'hidden':'владелец скрыт',
-                'not_public':'API не подтверждает публичность владельца',
-                'other_owner_type':'другой тип владельца (не личный аккаунт)',
-                'missing_username':'публичный владелец, username не предоставлен',
-                'unrecognized':'формат данных владельца не распознан',
-                'conflicting_owner':'данные владельца противоречат друг другу',
-            }
-            title+='\n\nПубличный владелец: '+item.get('public_username',owner_messages.get(item.get('owner_status'),'не указан'))
+            title+='\n\nПубличный владелец: '+item['owner_display']
+            username=item.get('public_username','')
+            if item.get('owner_status')=='available' and re.fullmatch(r'@[A-Za-z0-9_]{4,32}',username):
+                rows=[[('Подарок',item['url']),('ЛС','https://t.me/'+username[1:])]]
             send(chat,title,ik(rows))
         except (GiftError,ValueError) as e:send(chat,str(e))
         return

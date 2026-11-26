@@ -120,9 +120,9 @@ class SeeTests(unittest.TestCase):
                 self.assertNotIn('example_owner',str(logs.output))
                 self.assertNotIn('owner_status',see_api.normalize(data))
     def test_admin_boundary(self):
-        with patch.object(app,'ADMIN_IDS',{99}),patch.object(see_api,'enabled',return_value=True),patch.object(see_api.client,'search',return_value=[]) as api,patch.object(app,'random_gifts',return_value=[]) as old:
+        with patch.object(app,'ADMIN_IDS',{99}),patch.object(see_api,'enabled',return_value=True),patch.object(see_api.client,'search_spread',return_value=[]) as api,patch.object(app,'random_gifts',return_value=[]) as old:
             app.search_gifts(123,10);api.assert_not_called();old.assert_called_once_with(10)
-            app.search_gifts(99,50);api.assert_called_once_with(50,None,None,exclude=set())
+            app.search_gifts(99,50);api.assert_called_once_with(50,exclude=set())
     def test_rate_limit(self):
         with patch.dict(os.environ,{'SEE_API_KEY':'test-secret'}),patch.object(self.c.opener,'open',side_effect=HTTPError('https://kartoshka.free/v1/ping',429,'limit',{'Retry-After':'70'},io.BytesIO())) as op:
             with self.assertRaises(GiftError):self.c.quota()

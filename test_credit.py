@@ -18,6 +18,12 @@ class CreditTests(unittest.TestCase):
         with patch.object(app,'credit_in_description',True):
             self.assertNotIn('https://see.tg',app.gift_pack([card],'random',single_card=True)[0])
             self.assertIn('Оценка не равна цене продажи',app.gift_pack([card],'random',single_card=True)[0])
-            self.assertIn('https://see.tg',app.gift_pack([card],'random')[0])
+            self.assertNotIn('https://see.tg',app.gift_pack([card],'random')[0])
+            self.assertIn('https://see.tg',app.gift_pack([card],'random',group_delivery=True)[0])
         with patch.object(app,'credit_in_description',False):
             self.assertIn('https://see.tg',app.gift_pack([card],'random',single_card=True)[0])
+
+    def test_link_preview_disabled(self):
+        with patch.object(app,'api') as api:
+            app.send(123,app.DATA_CREDIT)
+            self.assertEqual(api.call_args.kwargs['link_preview_options'],{'is_disabled':True})
