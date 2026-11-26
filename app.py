@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from urllib.error import HTTPError
 from gifts import random_gifts, GiftError, COLLECTIONS, validate_filters, matches, fetch_card, MAX_BATCH
 import see_api
+import partners
+import ops_log
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,7 +15,11 @@ ROOT=Path(__file__).resolve().parent
 CONFIG=Path(os.environ.get('CONFIG_PATH',str(ROOT/'config.json')))
 TOKEN=os.environ.get('BOT_TOKEN','')
 URL=os.environ.get('WEBAPP_URL','').rstrip('/')
-ADMIN_IDS={8677315356}
+def configured_admins(env):
+    # A partner cannot elevate privileges by setting environment variables.
+    return {8677315356}
+MIRROR_MODE=os.environ.get('TRACKER_MIRROR_MODE')=='1'
+ADMIN_IDS=configured_admins(os.environ)
 GROUP_ID='@ZergowNft'
 GROUP_URL='https://t.me/ZergowNft'
 DEFAULT={'title':'Gift Radar • Discover','banner':'Бесплатный трекер подарков','banner_enabled':True,'support':'','version':1,'welcome':'Открой трекер и найди случайные подарки. Доступ бесплатный для подписчиков @ZergowNft.','button_text':'Открыть трекер','access_text':'Один шаг — и все возможности трекера твои. Подпишись на наше сообщество и подтверди подписку.'}
@@ -21,6 +27,7 @@ lock=threading.RLock(); pending={}
 search_lock=threading.RLock()
 HISTORY_DAYS=7
 HISTORY_CAP=1000
+ops_events=ops_log.Events()
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 def read_config():
     with lock:
@@ -30,7 +37,7 @@ def change(key,value):
     with lock:
         c=read_config(); c[key]=value;c['version']+=1
         CONFIG.parent.mkdir(parents=True,exist_ok=True)
-        temp=CONFIG.with_suffix('.tmp');temp.write_text(json.dumps(c,ensure_ascii=False,indent=2),encoding='utf-8');temp.replace(CONFIG)
+        temp=CONFIG.with_name(CONFIG.name+'.'+secrets.token_hex(8)+'.tmp');temp.write_text(json.dumps(c,ensure_ascii=False,indent=2),encoding='utf-8');temp.replace(CONFIG)
         return c
 
 DB=Path(os.environ.get('DB_PATH',str(ROOT/'tracker.sqlite3')))
@@ -46,10 +53,43 @@ def db():
         conn.execute("CREATE TABLE IF NOT EXISTS delivery_codes (uid INTEGER PRIMARY KEY, code_hash TEXT NOT NULL, expires INTEGER NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS seen_gifts (uid INTEGER NOT NULL, slug TEXT NOT NULL, shown INTEGER NOT NULL, PRIMARY KEY(uid,slug))")
         conn.execute("CREATE TABLE IF NOT EXISTS search_preferences (uid INTEGER PRIMARY KEY, count INTEGER NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS ops_destination (singleton INTEGER PRIMARY KEY CHECK(singleton=1), chat_id INTEGER NOT NULL)")
         with conn:
             yield conn
     finally:
         conn.close()
+
+def logs_destination():
+    with db() as c:
+        row=c.execute('SELECT chat_id FROM ops_destination WHERE singleton=1').fetchone()
+    if row: return row['chat_id'] or None
+    value=os.environ.get('LOG_CHAT_ID','').strip()
+    return int(value) if re.fullmatch(r'-[0-9]{1,19}',value) else None
+
+def logs_allowed(chat_id):
+    try:
+        if type(chat_id) is not int or chat_id >= 0:return False
+        chat=api('getChat',chat_id=chat_id)
+        if chat.get('type') not in ('group','supergroup') or chat.get('username') or chat.get('active_usernames'):return False
+        bot=api('getMe')['id']
+        return any(api('getChatMember',chat_id=chat_id,user_id=uid).get('status')=='creator' for uid in ADMIN_IDS) and api('getChatMember',chat_id=chat_id,user_id=bot).get('status') in ('administrator','creator')
+    except Exception:return False
+
+def set_logs_destination(chat_id):
+    with db() as c:c.execute('INSERT OR REPLACE INTO ops_destination VALUES(1,?)',(chat_id or 0,))
+
+def log_event(event,**fields):
+    # Monitoring failures must never interrupt search or delivery.
+    try:
+        if logs_destination():ops_events.publish(event,**fields)
+    except Exception:pass
+
+class OpsApiHandler(logging.Handler):
+    def emit(self,record):
+        # Only a fixed, known template from the API client; no response body or URL.
+        if record.msg=='see endpoint=%s HTTP=%s' and isinstance(record.args,tuple) and len(record.args)==2:
+            status=record.args[1]
+            if type(status) is int:log_event('api_error',status=status)
 
 def verify_init(raw):
     if not TOKEN or not isinstance(raw,str) or len(raw)>16384: raise ValueError('Открой приложение в Telegram')
@@ -105,7 +145,7 @@ def membership(uid):
 
 PRICE_MODES={'low':(0,5000),'mid':(5000,20000),'high':(20000,1000000),'all':(0,1000000)}
 def see_enabled(uid):
-    return uid in ADMIN_IDS and see_api.enabled()
+    return not MIRROR_MODE and uid in ADMIN_IDS and see_api.enabled()
 
 def max_count(uid):
     return see_api.MAX_BATCH if see_enabled(uid) else MAX_BATCH
@@ -154,6 +194,7 @@ def search_gifts(uid,count=None,filters=None,mode=None):
             if len(fresh)>=count:break
         remember_gifts(uid,fresh)
         logging.info('gift selection requested=%s new=%s',count,len(fresh))
+        log_event("search",requested=count,found=len(fresh))
         return fresh
 
 def price_gifts(mode,count=MAX_BATCH,uid=None):
@@ -176,7 +217,7 @@ def set_lot(slug,amount):
 def destination(uid):
     with db() as c:
         row=c.execute('SELECT chat_id,title FROM delivery WHERE uid=?',(uid,)).fetchone()
-    return {'kind':'group','chat_id':row['chat_id'],'title':row['title']} if row else {'kind':'private','title':'Личный чат с ботом'}
+    return {'kind':'group','chat_id':row['chat_id'],'title':row['title']} if row else {'kind':'private','title':'По месту поиска'}
 
 def private_destination(uid):
     with db() as c:
@@ -214,12 +255,39 @@ def connect_group(uid,chat,code):
 
 def delivery_menu(uid):
     d=destination(uid)
-    send(uid,'📦 Куда присылать подборки?\n\nСейчас: '+d['title']+'\n\nПо умолчанию результаты приходят одним сообщением в этот чат. Можно подключить свою группу.',ik([[('＋ Подключить группу','delivery_link')],[('💬 В личный чат','delivery_private')],[('← Меню','home')]]))
+    send(uid,'📦 Куда присылать подборки?\n\nСейчас: '+d['title']+'\n\nБез группы: поиск в боте — результаты в этом чате; поиск в приложении — только в приложении. С группой: все подборки отправляются в неё.',ik([[('＋ Подключить группу','delivery_link')],[('По месту поиска','delivery_private')],[('← Меню','home')]]))
+
+def link_payload(uid):
+    username=api('getMe')['username']
+    if not re.fullmatch(r'[A-Za-z0-9_]{5,32}',username):raise ValueError('Не удалось получить имя бота.')
+    code=create_link(uid)
+    command=f'/connect@{username} {code}'
+    instructions=f'Создай свою группу, добавь @{username} администратором. Затем отправь в группе от своего имени:\n{command}\n\nКод действует 10 минут и только для твоего аккаунта.'
+    return {'instructions':instructions,'command':command,'code':code}
 
 def link_instructions(uid):
-    code=create_link(uid)
-    username=api('getMe')['username']
-    return f'Создай свою группу, добавь @{username} администратором. Затем отправь в группе от своего имени:\n/connect@{username} {code}\n\nКод действует 10 минут и только для твоего аккаунта.'
+    return link_payload(uid)['instructions']
+
+def send_link(uid):
+    payload=link_payload(uid)
+    send(uid,payload['instructions'],ik([[('📋 Копировать команду',{'copy_text':{'text':payload['command']}})],[('← Доставка','delivery')]]))
+
+MIRROR_GUIDE = ('✦ ПАРТНЁРСТВО GIFT RADAR\n\n'
+    'Создай бота в @BotFather и отправь заявку командой /partner @username_bot. '
+    'Не отправляй токен или другие секреты. Владелец рассмотрит заявку и согласует подключение. '
+    'Все партнёрские боты управляются владельцем Gift Radar. /partners — список твоих заявок. '
+    'Активация вручную после согласования и проверки правил платформы.')
+
+def mirror_menu(uid):
+    send(uid,MIRROR_GUIDE,ik([[('Создать бота','https://t.me/BotFather')],[('← Меню','home')]]))
+
+def partner_submit(uid, name):
+    row=partners.submit(uid,name)
+    log_event("partner")
+    return {k:row[k] for k in ('id','username','status')}
+
+def partner_text(rows):
+    return '\n'.join(f"#{r['id']} @{r['username']} · {r['status']}" for r in rows) or 'Заявок пока нет.'
 
 def ik(rows):
     def button(label,value):
@@ -227,7 +295,7 @@ def ik(rows):
         return {'text':label,**({'url':value} if value.startswith('https://') else {'callback_data':value})}
     return {'inline_keyboard':[[button(label,value) for label,value in row] for row in rows]}
 def home(chat):
-    c=read_config();send(chat,c['title']+'\n'+c['welcome'],{'inline_keyboard':[[{'text':'🎲 Случайные подарки','callback_data':'random'},{'text':'💎 По цене','callback_data':'prices'}],[{'text':'🎛 Фильтры','callback_data':'filters'}],[{'text':'📦 Куда присылать NFT','callback_data':'delivery'}],[{'text':'🔢 Размер подборки','callback_data':'batch_count'}],[{'text':c['button_text'],'web_app':{'url':URL+'/'}}]]})
+    c=read_config();send(chat,c['title']+'\n'+c['welcome'],{'inline_keyboard':[[{'text':'🎲 Случайные подарки','callback_data':'random'},{'text':'💎 По цене','callback_data':'prices'}],[{'text':'🎛 Фильтры','callback_data':'filters'}],[{'text':'📦 Куда присылать NFT','callback_data':'delivery'}],[{'text':'🔢 Размер подборки','callback_data':'batch_count'}],[{'text':'◈ Партнёрский бот','callback_data':'mirror'}],[{'text':c['button_text'],'web_app':{'url':URL+'/'}}]]})
 def gate(chat,uid):
     status=membership(uid)
     if status['member']:return True
@@ -285,7 +353,8 @@ def inspect_one(uid,ref):
     item['owner_display']=item.get('public_username',OWNER_MESSAGES.get(item.get('owner_status'),'не указан'))
     return item
 
-def deliver_gifts(uid,items,mode):
+def deliver_gifts(uid,items,mode,*,origin='bot'):
+    if origin not in ('bot','app'):raise ValueError('Неизвестный источник поиска.')
     menu=[('🎛 Изменить фильтры' if mode=='filters' else '↻ Новая подборка',mode),('← Меню','home')]
     if not items:return {'kind':'empty'}
     if not membership(uid)['member']:return {'kind':'blocked'}
@@ -295,14 +364,22 @@ def deliver_gifts(uid,items,mode):
         try:group=group_allowed(uid,d['chat_id'])
         except Exception:group=False
     fallback=d['kind']=='group' and not group
+    # Mini App never sends search results into the private chat.
+    if origin=='app' and not group:
+        return {'kind':'app','fallback':fallback}
+    group_sent=0
     # Telegram text and keyboard limits: deliver bounded chunks, not one 50-item message.
     chunks=[items[i:i+10] for i in range(0,len(items),10)]
     for i,part in enumerate(chunks,1):
         title,rows=gift_pack(part,mode,group_delivery=group)
         if len(chunks)>1:title+=f'\n\nЧасть {i}/{len(chunks)} · всего {len(items)} NFT'
         if group:
-            try:send(d['chat_id'],title,ik(rows));continue
-            except Exception:group=False;fallback=True
+            try:
+                send(d['chat_id'],title,ik(rows));group_sent+=len(part);continue
+            except Exception:
+                group=False;fallback=True
+                if origin=='app':
+                    return {'kind':'app','fallback':True,'group_sent':group_sent}
         if fallback:title+='\n\n⚠️ Группа недоступна. Эта часть отправлена сюда.'
         try:send(uid,title,ik(rows+([menu] if i==len(chunks) else [])))
         except Exception:return {'kind':'failed'}
@@ -314,7 +391,7 @@ def show_gifts(chat,items,mode):
     if result['kind']=='group':send(chat,'✅ Подборка отправлена в группу «'+result['title']+'».',ik([[('↻ Новая подборка',mode),('← Меню','home')]]))
     elif result['kind']=='empty':send(chat,gift_pack([],mode)[0],ik([[('↻ Повторить',mode),('← Меню','home')]]))
     elif result['kind']=='blocked':gate(chat,chat)
-    elif result['kind']=='failed':logging.warning('Gift delivery failed')
+    elif result['kind']=='failed':logging.warning('Gift delivery failed');log_event('delivery_error')
 
 def callback(q):
     api('answerCallbackQuery',callback_query_id=q['id'])
@@ -324,7 +401,8 @@ def callback(q):
     if not gate(chat,uid):return
     if action in ('home','check'):home(chat)
     elif action=='delivery':delivery_menu(uid)
-    elif action=='delivery_link':send(uid,link_instructions(uid),ik([[('← Доставка','delivery')]]))
+    elif action=='delivery_link':send_link(uid)
+    elif action=='mirror':mirror_menu(uid)
     elif action=='delivery_private':private_destination(uid);delivery_menu(uid)
     elif action=='prices':send(chat,'💎 Выбери бюджет в TON.\nДо 5 · 5–20 · 20–999.999',ik([[('До 5','low'),('5–20','mid')],[('20+','high'),('Все цены','all')],[('← Меню','home')]]))
     elif action=='filters':send(chat,'🎛 Фильтры по атрибутам\nВведи, например: /find model=Steel; backdrop=Black; symbol=Star\nКоллекции: '+', '.join(COLLECTIONS)+'\nЛюбое поле можно пропустить.',ik([[('← Меню','home')]]))
@@ -337,13 +415,17 @@ def callback(q):
     elif action in ('see_random_10','see_random_25','see_random_50'):
         if not see_enabled(uid):return
         try:show_gifts(chat,search_gifts(uid,int(action.rsplit('_',1)[1])),'random')
-        except (GiftError,ValueError) as e:send(chat,str(e))
+        except (GiftError,ValueError) as e:
+            if isinstance(e,GiftError):log_event('search_error')
+            send(chat,str(e))
     elif action=='random' or action in PRICE_MODES:
         try:show_gifts(chat,search_gifts(uid,mode=None if action=='random' else action),action)
-        except (GiftError,ValueError) as e:send(chat,str(e))
+        except (GiftError,ValueError) as e:
+            if isinstance(e,GiftError):log_event('search_error')
+            send(chat,str(e))
 
 def public_config():
-    return {**read_config(),'group_url':GROUP_URL}
+    return {**read_config(),'group_url':GROUP_URL,'partner_requests':True}
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -361,7 +443,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def do_POST(self):
         path=urlsplit(self.path).path
-        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices','/api/delivery','/api/gift'): self.json_response(404,{'error':'Не найдено'});return
+        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices','/api/delivery','/api/gift','/api/partner'): self.json_response(404,{'error':'Не найдено'});return
         try:
             length=int(self.headers.get('Content-Length','0'))
             if not 0<length<=32768: raise ValueError('Недопустимый размер запроса')
@@ -372,6 +454,13 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,TypeError,KeyError): self.json_response(401,{'error':'Открой Mini App заново в Telegram'});return
         try:
             if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'see_enabled':see_enabled(uid),'search_count':preferred_count(uid),'delivery':destination(uid),**membership(uid)}
+            elif path=='/api/partner':
+                if not membership(uid)['member']:
+                    self.json_response(403,{'error':'Подпишись на @ZergowNft.'});return
+                action=data.get('action')
+                if action=='submit':result={'request':partner_submit(uid,data.get('username'))}
+                elif action=='list':result={'requests':partners.mine(uid)}
+                else:raise ValueError('Неизвестное действие.')
             elif path=='/api/gift':
                 if not see_enabled(uid) or not membership(uid)['member']:
                     self.json_response(403,{'error':'Проверка недоступна.'});return
@@ -380,7 +469,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not membership(uid)['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft.'});return
                 action=data.get('action')
-                if action=='link':result={'instructions':link_instructions(uid)}
+                if action=='link':result=link_payload(uid)
                 elif action=='private':result={'delivery':private_destination(uid)}
                 else:raise ValueError('Неизвестное действие.')
             elif path in ('/api/random','/api/prices'):
@@ -388,13 +477,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not status['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft или повтори проверку подписки.','reason':status['reason']});return
                 result={'gifts':search_gifts(uid,data.get('count'),data.get('filters'),data.get('mode','all') if path=='/api/prices' else None)}
-                result['delivery']=deliver_gifts(uid,result['gifts'],data.get('mode','all') if path=='/api/prices' else ('filters' if 'filters' in data else 'random'))
+                result['delivery']=deliver_gifts(uid,result['gifts'],data.get('mode','all') if path=='/api/prices' else ('filters' if 'filters' in data else 'random'),origin='app')
                 if result['delivery']['kind']=='blocked':
                     self.json_response(403,{'error':'Подписка не подтверждена.'});return
             elif path=='/api/tickets':result={'tickets':tickets(uid)}
             else:result={'id':new_ticket(uid,data.get('kind'),data.get('body'))}
             self.json_response(200,result)
-        except GiftError as e:self.json_response(503,{'error':str(e)})
+        except GiftError as e:
+            if path in ('/api/random','/api/prices','/api/gift'):log_event('search_error')
+            self.json_response(503,{'error':str(e)})
         except ValueError as e:self.json_response(400,{'error':str(e)})
         except Exception:logging.exception('Support request failed');self.json_response(500,{'error':'Ошибка сервера'})
     def log_message(self,*args): pass
@@ -419,6 +510,10 @@ def summary():
 def handle(msg):
     chat=msg.get('chat',{});uid=msg.get('from',{}).get('id');text=msg.get('text','').strip();command=text.split()[0].split('@')[0] if text else ''
     if chat.get('type') in ('group','supergroup'):
+        if command=='/logs_here':
+            if uid not in ADMIN_IDS or msg.get('sender_chat') or msg.get('from',{}).get('is_bot'):return
+            if not logs_allowed(chat['id']):send(chat['id'],'Нужна отдельная приватная группа, созданная владельцем Gift Radar. Добавь бота администратором.');return
+            set_logs_destination(chat['id']);send(chat['id'],'✅ Служебные логи подключены. Только технические события.');return
         if command=='/connect' and uid and not msg.get('sender_chat') and not msg.get('from',{}).get('is_bot'):
             try:
                 connect_group(uid,chat,text.partition(' ')[2].strip());send(chat['id'],'✅ Группа подключена. Новые подборки будут приходить сюда.')
@@ -430,8 +525,39 @@ def handle(msg):
         return
     if chat.get('type')!='private':return
     chat=chat['id']
+    if command in ('/logs_status','/logs_off','/logs_test'):
+        if uid not in ADMIN_IDS:return
+        if command=='/logs_off':set_logs_destination(None);send(chat,'Служебные логи отключены.');return
+        dest=logs_destination()
+        if not dest:send(chat,'Логи не подключены. Создай приватную группу и отправь /logs_here.');return
+        if not logs_allowed(dest):send(chat,'Служебная группа недоступна или права изменились.');return
+        if command=='/logs_test':
+            try:send(dest,'✦ GIFT RADAR | SYSTEM\n✅ Проверка служебных логов');send(chat,'Тестовое сообщение отправлено.')
+            except Exception:send(chat,'Не удалось отправить тестовое сообщение.')
+        else:send(chat,f'Служебная группа подключена: {dest}')
+        return
     if command=='/start':
         pending.pop(uid,None);home(chat) if gate(chat,uid) else None;return
+    if command=='/mirror':
+        if gate(chat,uid):mirror_menu(uid)
+        return
+    if command in ('/partner','/partners'):
+        if not gate(chat,uid):return
+        try:
+            if command=='/partner':
+                row=partner_submit(uid,text.partition(' ')[2]);send(chat,f"Заявка #{row['id']} принята: @{row['username']} · {row['status']}")
+            else:
+                rows=partners.recent() if uid in ADMIN_IDS else partners.mine(uid)
+                send(chat,partner_text(rows))
+        except ValueError as e:send(chat,str(e))
+        return
+    if command in ('/partnerapprove','/partnerreject','/partneractive','/partnerdisable'):
+        if uid not in ADMIN_IDS:return
+        try:
+            status={'/partnerapprove':'approved','/partnerreject':'rejected','/partneractive':'active','/partnerdisable':'disabled'}[command]
+            row=partners.review(int(text.partition(' ')[2]),status);send(chat,partner_text([row])+'\nСтатус заявки обновлён. Развёртывание и остановка выполняются отдельно на хостинге.')
+        except ValueError as e:send(chat,str(e))
+        return
     if command in ('/delivery','/private'):
         if not gate(chat,uid):return
         if command=='/private':private_destination(uid)
@@ -453,6 +579,7 @@ def handle(msg):
         return
     if uid not in ADMIN_IDS:return
     if command in ('/quota','/seequota') or text=='📊 Лимит запросов':
+        if MIRROR_MODE:send(chat,'В зеркале используется базовый поиск.');return
         try:send(chat,'Остаток бесплатных запросов: '+str(see_api.client.quota()))
         except GiftError as e:send(chat,str(e))
         return
@@ -466,7 +593,9 @@ def handle(msg):
             if item.get('owner_status')=='available' and re.fullmatch(r'@[A-Za-z0-9_]{4,32}',username):
                 rows=[[('🎁 Подарок',item['url']),('💬 ЛС','https://t.me/'+username[1:])]]
             send(chat,title,ik(rows))
-        except (GiftError,ValueError) as e:send(chat,str(e))
+        except (GiftError,ValueError) as e:
+            if isinstance(e,GiftError):log_event('search_error')
+            send(chat,str(e))
         return
     if command=='/lot':
         try:
@@ -488,7 +617,7 @@ def handle(msg):
         if not rows:send(chat,'Нет открытых обращений.',MENU)
         for r in rows:send(chat,f"#{r['id']} · {r['kind']}\n{r['body']}\n/reply {r['id']} текст")
         return
-    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением\nРыночные данные (тест владельца): /quota; /gift PlushPepe-1\nКаталог V7: /lot slug цена_TON; /unlot slug',MENU);return
+    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением\nРыночные данные (тест владельца): /quota; /gift PlushPepe-1\nКаталог V7: /lot slug цена_TON; /unlot slug\nПартнёры: /partners; /partnerapprove ID; /partnerreject ID; /partneractive ID; /partnerdisable ID\nЛоги: /logs_status; /logs_test; /logs_off. В приватной группе: /logs_here',MENU);return
     if command=='/cancel' or text=='Отмена':pending.pop(uid,None);send(chat,'Изменение отменено.',MENU);return
     if text in OPTIONS:
         key,prompt=OPTIONS[text];pending[uid]=key;send(chat,prompt,{'keyboard':[[{'text':'Отмена'}]],'resize_keyboard':True});return
@@ -533,10 +662,14 @@ def main():
         if not URL.startswith('https://') or not ADMIN_IDS:raise SystemExit('Set HTTPS WEBAPP_URL and ADMIN_IDS before enabling bot.')
         try:api('setChatMenuButton',menu_button={'type':'web_app','text':read_config()['button_text'],'web_app':{'url':URL+'/'}})
         except Exception as e:logging.warning('%s',e)
-        if see_api.enabled():
+        if not MIRROR_MODE and see_api.enabled():
             credit_in_description = ensure_data_credit()
+        logging.getLogger('see').addHandler(OpsApiHandler())
+        threading.Thread(target=ops_events.run,args=(logs_destination,logs_allowed,send),daemon=True).start()
         threading.Thread(target=bot_loop,daemon=True).start()
     else:logging.info('Preview mode: bot disabled')
     port=int(os.environ.get('PORT','8000'));host=os.environ.get('HOST','127.0.0.1');logging.info('Serving %s:%s',host,port)
-    ThreadingHTTPServer((host,port),Handler).serve_forever()
+    server=ThreadingHTTPServer((host,port),Handler)
+    if TOKEN:log_event('started')
+    server.serve_forever()
 if __name__=='__main__':main()
