@@ -9,7 +9,7 @@ import app,gifts
 class Tests(unittest.TestCase):
     def setUp(self):
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup)
-        p=patch.multiple(app,TOKEN='test',GROUP_ID='-100123',ADMIN_IDS={99},CONFIG=Path(t.name)/'config.json',DB=Path(t.name)/'db.sqlite',URL='https://example.test');p.start();self.addCleanup(p.stop)
+        p=patch.multiple(app,TOKEN='test',GROUP_ID='@ZergowNft',ADMIN_IDS={99},CONFIG=Path(t.name)/'config.json',DB=Path(t.name)/'db.sqlite',URL='https://example.test');p.start();self.addCleanup(p.stop)
     def signed(self,uid=123):
         f={'auth_date':str(int(time.time())),'user':json.dumps({'id':uid})}
         secret=hmac.new(b'WebAppData',app.TOKEN.encode(),hashlib.sha256).digest();f['hash']=hmac.new(secret,'\n'.join(f'{k}={v}' for k,v in sorted(f.items())).encode(),hashlib.sha256).hexdigest();return urlencode(f)
@@ -21,6 +21,19 @@ class Tests(unittest.TestCase):
             with patch.object(app,'api',return_value={'status':status,'is_member':flag}):self.assertEqual(app.membership(123)['member'],expected)
         with patch.object(app,'api',side_effect=RuntimeError):self.assertFalse(app.membership(123)['member'])
         with patch.object(app,'GROUP_ID',''):self.assertFalse(app.membership(123)['member'])
+    def test_channel_target_and_prompt(self):
+        self.assertEqual(app.GROUP_URL,'https://t.me/ZergowNft')
+        with patch.object(app,'api',return_value={'status':'left'}) as api,patch.object(app,'send') as send:
+            self.assertFalse(app.gate(123,123))
+            api.assert_called_once_with('getChatMember',chat_id='@ZergowNft',user_id=123)
+            self.assertIn('@ZergowNft',send.call_args.args[1])
+            self.assertEqual(send.call_args.args[2]['inline_keyboard'][0][0]['url'],app.GROUP_URL)
+        self.assertIn('access_text',app.public_config())
+    def test_admin_access_text(self):
+        with patch.object(app,'send'):
+            for text in ('🔐 Текст подписки','Привет, подписывайся!'):
+                app.handle({'chat':{'type':'private','id':99},'from':{'id':99},'text':text})
+            self.assertEqual(app.public_config()['access_text'],'Привет, подписывайся!')
     def test_gate(self):
         srv=app.ThreadingHTTPServer(('127.0.0.1',0),app.Handler);t=threading.Thread(target=srv.serve_forever,daemon=True);t.start()
         try:
@@ -28,7 +41,7 @@ class Tests(unittest.TestCase):
             with patch.object(app,'api',return_value={'status':'left'}),patch.object(app,'random_gifts') as f:
                 with self.assertRaises(HTTPError) as e:call()
                 self.assertEqual(e.exception.code,403);f.assert_not_called()
-            with patch.object(app,'api',return_value={'status':'member'}),patch.object(app,'random_gifts',return_value=[{'slug':'PlushPepe-123'}]):
+            with patch.object(app,'api',return_value={'status':'member'}),patch.object(app,'random_gifts',return_value=[{'slug':'PlushPepe-123','name':'Plush Pepe','number':123,'model':'Steel','backdrop':'Black','symbol':'Star','url':'https://t.me/nft/PlushPepe-123'}]):
                 with call() as r:self.assertEqual(json.load(r)['gifts'][0]['slug'],'PlushPepe-123')
         finally:srv.shutdown();srv.server_close();t.join()
     def test_public_fields(self):
@@ -65,4 +78,39 @@ class Tests(unittest.TestCase):
             app.callback(q);f.assert_not_called()
         with patch.object(app,'api'),patch.object(app,'membership',return_value={'member':True}),patch.object(app,'send'),patch.object(app,'random_gifts',return_value=[]) as f:
             app.callback(q);f.assert_called_once_with(3)
+    def card(self):
+        return {'slug':'PlushPepe-123','name':'Plush Pepe','number':123,'url':'https://t.me/nft/PlushPepe-123','model':'Steel','backdrop':'Black','symbol':'Star'}
+    def test_delivery_private(self):
+        with patch.object(app,'membership',return_value={'member':True}),patch.object(app,'send') as send:
+            result=app.deliver_gifts(123,[self.card()]*3,'random')
+            self.assertEqual(result['kind'],'private');send.assert_called_once();self.assertEqual(send.call_args.args[0],123);self.assertIn('3 шт.',send.call_args.args[1])
+    def test_connect_group(self):
+        code=app.create_link(123);chat={'id':-100123,'type':'supergroup','title':'My NFT'}
+        with patch.object(app,'group_allowed',return_value=True),patch.object(app,'membership',return_value={'member':True}):
+            with self.assertRaises(ValueError):app.connect_group(456,chat,code)
+            self.assertEqual(app.connect_group(123,chat,code)['chat_id'],-100123)
+            with self.assertRaises(ValueError):app.connect_group(123,chat,code)
+            self.assertEqual(app.destination(456)['kind'],'private')
+            with patch.object(app,'send') as send:
+                self.assertEqual(app.deliver_gifts(123,[self.card()],'random')['kind'],'group');send.assert_called_once();self.assertEqual(send.call_args.args[0],-100123)
+                self.assertTrue(all('url' in b for r in send.call_args.args[2]['inline_keyboard'] for b in r))
+        with patch.object(app,'membership',return_value={'member':True}),patch.object(app,'group_allowed',return_value=False),patch.object(app,'send') as send:
+            self.assertTrue(app.deliver_gifts(123,[self.card()],'random')['fallback']);send.assert_called_once();self.assertEqual(send.call_args.args[0],123)
+        self.assertEqual(app.private_destination(123)['kind'],'private')
+    def test_group_permissions_and_expiry(self):
+        code=app.create_link(123);chat={'id':-100123,'type':'supergroup','title':'My NFT'}
+        with patch.object(app,'membership',return_value={'member':True}),patch.object(app,'group_allowed',return_value=False):
+            with self.assertRaises(ValueError):app.connect_group(123,chat,code)
+        with app.db() as c:c.execute('UPDATE delivery_codes SET expires=0')
+        with self.assertRaises(ValueError):app.connect_group(123,chat,code)
+    def test_group_permission_api(self):
+        def api(method,**kw):
+            if method=='getChat':return {'username':'other_group'}
+            if method=='getMe':return {'id':777}
+            return {'status':'administrator' if kw['user_id']==777 else 'member'}
+        with patch.object(app,'api',side_effect=api):self.assertFalse(app.group_allowed(123,-100123))
+        with patch.object(app,'api',return_value={'username':'ZergowNft'}):self.assertFalse(app.group_allowed(123,-100123))
+    def test_delivery_blocked(self):
+        with patch.object(app,'membership',return_value={'member':False}),patch.object(app,'send') as send:
+            self.assertEqual(app.deliver_gifts(123,[self.card()],'random')['kind'],'blocked');send.assert_not_called()
 if __name__=='__main__':unittest.main()

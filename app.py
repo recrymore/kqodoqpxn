@@ -1,5 +1,6 @@
 """Design-stage Telegram Mini App, standard-library only. Run: python app.py."""
-import copy, json, os, re, threading, time, logging, hmac, hashlib, sqlite3
+import copy, json, os, re, threading, time, logging, hmac, hashlib, sqlite3, secrets
+from contextlib import contextmanager
 from urllib.error import HTTPError
 from gifts import random_gifts, GiftError, COLLECTIONS, validate_filters, matches, fetch_card
 from decimal import Decimal, InvalidOperation
@@ -12,9 +13,9 @@ CONFIG=Path(os.environ.get('CONFIG_PATH',str(ROOT/'config.json')))
 TOKEN=os.environ.get('BOT_TOKEN','')
 URL=os.environ.get('WEBAPP_URL','').rstrip('/')
 ADMIN_IDS={8677315356}
-GROUP_ID=os.environ.get('GROUP_ID','').strip()
-GROUP_URL=os.environ.get('GROUP_URL','https://t.me/+DxLz5PTGdiRlZjVi')
-DEFAULT={'title':'Gift Radar • Discover','banner':'Бесплатный трекер подарков','banner_enabled':True,'support':'','version':1,'welcome':'Открой трекер и найди случайные подарки. Доступ бесплатный для участников группы.','button_text':'Открыть трекер'}
+GROUP_ID='@ZergowNft'
+GROUP_URL='https://t.me/ZergowNft'
+DEFAULT={'title':'Gift Radar • Discover','banner':'Бесплатный трекер подарков','banner_enabled':True,'support':'','version':1,'welcome':'Открой трекер и найди случайные подарки. Доступ бесплатный для подписчиков @ZergowNft.','button_text':'Открыть трекер','access_text':'Один шаг — и все возможности трекера твои. Подпишись на наше сообщество и подтверди подписку.'}
 lock=threading.RLock(); pending={}
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 def read_config():
@@ -29,13 +30,20 @@ def change(key,value):
         return c
 
 DB=Path(os.environ.get('DB_PATH',str(ROOT/'tracker.sqlite3')))
+@contextmanager
 def db():
     DB.parent.mkdir(parents=True,exist_ok=True)
     conn=sqlite3.connect(DB,timeout=10)
-    conn.row_factory=sqlite3.Row
-    conn.execute('CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY, uid INTEGER NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, reply TEXT, replied INTEGER)')
-    conn.execute('CREATE TABLE IF NOT EXISTS lots (slug TEXT PRIMARY KEY, price_milli INTEGER NOT NULL, card TEXT NOT NULL, updated INTEGER NOT NULL)')
-    return conn
+    try:
+        conn.row_factory=sqlite3.Row
+        conn.execute('CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY, uid INTEGER NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, reply TEXT, replied INTEGER)')
+        conn.execute('CREATE TABLE IF NOT EXISTS lots (slug TEXT PRIMARY KEY, price_milli INTEGER NOT NULL, card TEXT NOT NULL, updated INTEGER NOT NULL)')
+        conn.execute("CREATE TABLE IF NOT EXISTS delivery (uid INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, title TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS delivery_codes (uid INTEGER PRIMARY KEY, code_hash TEXT NOT NULL, expires INTEGER NOT NULL)")
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 def verify_init(raw):
     if not TOKEN or not isinstance(raw,str) or len(raw)>16384: raise ValueError('Открой приложение в Telegram')
@@ -83,7 +91,7 @@ def answer_ticket(tid,reply):
 def membership(uid):
     if not GROUP_ID: return {'member':False,'reason':'group_not_configured'}
     try:
-        m=api('getChatMember',chat_id=int(GROUP_ID),user_id=uid)
+        m=api('getChatMember',chat_id=GROUP_ID,user_id=uid)
         ok=m.get('status') in ('creator','administrator','member') or (m.get('status')=='restricted' and m.get('is_member') is True)
         return {'member':bool(ok),'reason':'ok' if ok else 'not_member'}
     except Exception:
@@ -107,30 +115,110 @@ def set_lot(slug,amount):
     if not card:raise ValueError('Публичная карточка не найдена.')
     with db() as c:c.execute('INSERT OR REPLACE INTO lots VALUES(?,?,?,?)',(slug,int(milli),json.dumps(card,ensure_ascii=False),int(time.time())))
 
+def destination(uid):
+    with db() as c:
+        row=c.execute('SELECT chat_id,title FROM delivery WHERE uid=?',(uid,)).fetchone()
+    return {'kind':'group','chat_id':row['chat_id'],'title':row['title']} if row else {'kind':'private','title':'Личный чат с ботом'}
+
+def private_destination(uid):
+    with db() as c:
+        c.execute('DELETE FROM delivery WHERE uid=?',(uid,))
+        c.execute('DELETE FROM delivery_codes WHERE uid=?',(uid,))
+    return destination(uid)
+
+def create_link(uid):
+    code=secrets.token_urlsafe(12)
+    with db() as c:
+        c.execute('DELETE FROM delivery_codes WHERE expires<=?',(int(time.time()),))
+        c.execute('INSERT OR REPLACE INTO delivery_codes VALUES(?,?,?)',(uid,hashlib.sha256(code.encode()).hexdigest(),int(time.time())+600))
+    return code
+
+def group_allowed(uid,chat_id):
+    try:
+        if api('getChat',chat_id=chat_id).get('username','').lower()==GROUP_ID.lstrip('@').lower():return False
+        bot=api('getMe')['id']
+        return all(api('getChatMember',chat_id=chat_id,user_id=u).get('status') in ('creator','administrator') for u in (bot,uid))
+    except Exception:return False
+
+def connect_group(uid,chat,code):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{16}',code):raise ValueError('Неверный код подключения.')
+    hashed=hashlib.sha256(code.encode()).hexdigest()
+    with db() as c:
+        row=c.execute('SELECT code_hash,expires FROM delivery_codes WHERE uid=?',(uid,)).fetchone()
+    if not row or row['expires']<=time.time() or not hmac.compare_digest(row['code_hash'],hashed):raise ValueError('Код истёк или не принадлежит тебе. Получи новый в личном чате.')
+    if not membership(uid)['member']:raise ValueError('Сначала подтверди подписку на @ZergowNft.')
+    if chat.get('type') not in ('group','supergroup') or not group_allowed(uid,chat['id']):raise ValueError('Ты и бот должны быть администраторами отдельной группы.')
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if c.execute('DELETE FROM delivery_codes WHERE uid=? AND code_hash=? AND expires>?',(uid,hashed,int(time.time()))).rowcount!=1:raise ValueError('Код уже использован или истёк.')
+        c.execute('INSERT OR REPLACE INTO delivery VALUES(?,?,?)',(uid,chat['id'],str(chat.get('title','Группа'))[:128]))
+    return destination(uid)
+
+def delivery_menu(uid):
+    d=destination(uid)
+    send(uid,'📦 Куда присылать подборки?\n\nСейчас: '+d['title']+'\n\nПо умолчанию результаты приходят одним сообщением в этот чат. Можно подключить свою группу.',ik([[('＋ Подключить группу','delivery_link')],[('💬 В личный чат','delivery_private')],[('← Меню','home')]]))
+
+def link_instructions(uid):
+    code=create_link(uid)
+    username=api('getMe')['username']
+    return f'Создай свою группу, добавь @{username} администратором. Затем отправь в группе от своего имени:\n/connect@{username} {code}\n\nКод действует 10 минут и только для твоего аккаунта.'
+
 def ik(rows):return {'inline_keyboard':[[{'text':label,**({'url':value} if value.startswith('https://') else {'callback_data':value})} for label,value in row] for row in rows]}
 def home(chat):
-    c=read_config();send(chat,c['title']+'\n'+c['welcome'],{'inline_keyboard':[[{'text':'🎲 Случайные подарки','callback_data':'random'},{'text':'💎 По цене','callback_data':'prices'}],[{'text':'🎛 Фильтры','callback_data':'filters'}],[{'text':c['button_text'],'web_app':{'url':URL+'/'}}]]})
+    c=read_config();send(chat,c['title']+'\n'+c['welcome'],{'inline_keyboard':[[{'text':'🎲 Случайные подарки','callback_data':'random'},{'text':'💎 По цене','callback_data':'prices'}],[{'text':'🎛 Фильтры','callback_data':'filters'}],[{'text':'📦 Куда присылать NFT','callback_data':'delivery'}],[{'text':c['button_text'],'web_app':{'url':URL+'/'}}]]})
 def gate(chat,uid):
-    if membership(uid)['member']:return True
-    send(chat,'Для бесплатного доступа вступи в группу и подтверди участие.',ik([[('Вступить',GROUP_URL)],[('Проверить','check')]]));return False
+    status=membership(uid)
+    if status['member']:return True
+    text='✦ GIFT RADAR | ZERGOW NFT\n━━━━━━━━━━━━━━\n\n🔐 Открой бесплатный доступ\n\n'+read_config()['access_text']+'\n\n01 · Подпишись на @ZergowNft\n02 · Нажми «Проверить подписку»\n\n💎 Без оплаты и пробного периода.'
+    if status.get('reason')=='verification_failed':text+='\n\n⚠️ Проверка временно недоступна. Попробуй ещё раз.'
+    send(chat,text,ik([[('✦ Подписаться на Zergow NFT',GROUP_URL)],[('✓ Проверить подписку','check')]]));return False
+
+def gift_pack(items,mode):
+    title=f'✦ GIFT RADAR | ПОДБОРКА\n━━━━━━━━━━━━━━\n🔎 Найдено подарков: {len(items)} шт.'
+    if mode in PRICE_MODES:title+='\nЦены из каталога администратора; проверь на площадке.'
+    if not items:title+='\nСовпадений пока нет. Попробуй другой запрос.'
+    for i,g in enumerate(items,1):
+        title+=f"\n\n{i:02d} · {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+f"\n{g['model']} · {g['backdrop']} · {g['symbol']}"
+    rows=[[(f"{i}. Открыть NFT",g['url'])] for i,g in enumerate(items,1)]
+    return title,rows
+
+def deliver_gifts(uid,items,mode):
+    title,rows=gift_pack(items,mode)
+    menu=[('🎛 Изменить фильтры' if mode=='filters' else '↻ Новая подборка',mode),('← Меню','home')]
+    if not items:return {'kind':'empty'}
+    # Re-check access immediately before sending, not only before searching.
+    if not membership(uid)['member']:return {'kind':'blocked'}
+    d=destination(uid)
+    if d['kind']=='group':
+        try:
+            if not group_allowed(uid,d['chat_id']):raise ValueError('Группа недоступна')
+            # Group gets only gift URL buttons, no user-specific actions.
+            send(d['chat_id'],title,ik(rows))
+        except Exception:
+            title+='\n\n⚠️ Не удалось подтвердить доставку в группу. Подборка отправлена сюда.'
+        else:
+            return {'kind':'group','title':d['title']}
+    try:send(uid,title,ik(rows+[menu]))
+    except Exception:return {'kind':'failed'}
+    return {'kind':'private','fallback':d['kind']=='group'}
 
 def show_gifts(chat,items,mode):
-    title=f'🔎 Найдено: {len(items)}'
-    if not items:title+='\nСовпадений пока нет. Попробуй другой запрос.'
-    if mode in PRICE_MODES:title+='\nЦены из каталога администратора, проверь на площадке.'
-    for i,g in enumerate(items,1):
-        title+=f"\n\n{i}. {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+f"\n{g['model']} · {g['backdrop']} · {g['symbol']}"
-    rows=[[(f"{i}. Открыть NFT",g['url'])] for i,g in enumerate(items,1)]
-    rows.append([('🎛 Изменить фильтры' if mode=='filters' else '↻ Новая подборка',mode),('← Меню','home')]);send(chat,title,ik(rows))
+    result=deliver_gifts(chat,items,mode)
+    if result['kind']=='group':send(chat,'✅ Подборка отправлена в группу «'+result['title']+'».',ik([[('↻ Новая подборка',mode),('← Меню','home')]]))
+    elif result['kind']=='empty':send(chat,gift_pack([],mode)[0],ik([[('↻ Повторить',mode),('← Меню','home')]]))
+    elif result['kind']=='blocked':gate(chat,chat)
+    elif result['kind']=='failed':logging.warning('Gift delivery failed')
 
 def callback(q):
     api('answerCallbackQuery',callback_query_id=q['id'])
     msg=q.get('message',{});chat=msg.get('chat',{});uid=q.get('from',{}).get('id');action=q.get('data','')
     if chat.get('type')!='private' or chat.get('id')!=uid:return
     chat=chat['id']
-    if action=='home':home(chat);return
     if not gate(chat,uid):return
-    if action=='check':home(chat)
+    if action in ('home','check'):home(chat)
+    elif action=='delivery':delivery_menu(uid)
+    elif action=='delivery_link':send(uid,link_instructions(uid),ik([[('← Доставка','delivery')]]))
+    elif action=='delivery_private':private_destination(uid);delivery_menu(uid)
     elif action=='prices':send(chat,'💎 Выбери бюджет в TON.\nДо 5 · 5–20 · 20–999.999',ik([[('До 5','low'),('5–20','mid')],[('20+','high'),('Все цены','all')],[('← Меню','home')]]))
     elif action=='filters':send(chat,'🎛 Фильтры по атрибутам\nВведи, например: /find model=Steel; backdrop=Black; symbol=Star\nКоллекции: '+', '.join(COLLECTIONS)+'\nЛюбое поле можно пропустить.',ik([[('← Меню','home')]]))
     elif action=='random' or action in PRICE_MODES:
@@ -156,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def do_POST(self):
         path=urlsplit(self.path).path
-        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices'): self.json_response(404,{'error':'Не найдено'});return
+        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices','/api/delivery'): self.json_response(404,{'error':'Не найдено'});return
         try:
             length=int(self.headers.get('Content-Length','0'))
             if not 0<length<=32768: raise ValueError('Недопустимый размер запроса')
@@ -166,12 +254,22 @@ class Handler(BaseHTTPRequestHandler):
         try: uid=verify_init(data.get('initData'))
         except (ValueError,TypeError,KeyError): self.json_response(401,{'error':'Открой Mini App заново в Telegram'});return
         try:
-            if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,**membership(uid)}
+            if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'delivery':destination(uid),**membership(uid)}
+            elif path=='/api/delivery':
+                if not membership(uid)['member']:
+                    self.json_response(403,{'error':'Подпишись на @ZergowNft.'});return
+                action=data.get('action')
+                if action=='link':result={'instructions':link_instructions(uid)}
+                elif action=='private':result={'delivery':private_destination(uid)}
+                else:raise ValueError('Неизвестное действие.')
             elif path in ('/api/random','/api/prices'):
                 status=membership(uid)
                 if not status['member']:
-                    self.json_response(403,{'error':'Вступи в группу или повтори проверку доступа.','reason':status['reason']});return
+                    self.json_response(403,{'error':'Подпишись на @ZergowNft или повтори проверку подписки.','reason':status['reason']});return
                 result={'gifts':price_gifts(data.get('mode','all')) if path=='/api/prices' else (random_gifts(data.get('count',3),data['filters']) if 'filters' in data else random_gifts(data.get('count',3)))}
+                result['delivery']=deliver_gifts(uid,result['gifts'],data.get('mode','all') if path=='/api/prices' else ('filters' if 'filters' in data else 'random'))
+                if result['delivery']['kind']=='blocked':
+                    self.json_response(403,{'error':'Подписка не подтверждена.'});return
             elif path=='/api/tickets':result={'tickets':tickets(uid)}
             else:result={'id':new_ticket(uid,data.get('kind'),data.get('body'))}
             self.json_response(200,result)
@@ -192,20 +290,31 @@ def send(chat,text,markup=None):
     kw={'chat_id':chat,'text':text}
     if markup:kw['reply_markup']=markup
     return api('sendMessage',**kw)
-MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'👁 Показать / скрыть баннер'}],[{'text':'🏷 Название'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'Отмена'}]],'resize_keyboard':True}
-OPTIONS={'👋 Приветствие':('welcome','Введи приветствие до 500 символов.'),'🔘 Кнопка запуска':('button_text','Введи подпись кнопки до 48 символов.'),'✏️ Верхний баннер':('banner','Введи текст баннера до 240 символов.'),'🏷 Название':('title','Введи название до 64 символов.'),'💬 Контакт поддержки':('support','Введи @username поддержки или «-».')}
+MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'👁 Показать / скрыть баннер'}],[{'text':'🏷 Название'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'🔐 Текст подписки'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'Отмена'}]],'resize_keyboard':True}
+OPTIONS={'🔐 Текст подписки':('access_text','Введи текст просьбы о подписке до 500 символов.'),'👋 Приветствие':('welcome','Введи приветствие до 500 символов.'),'🔘 Кнопка запуска':('button_text','Введи подпись кнопки до 48 символов.'),'✏️ Верхний баннер':('banner','Введи текст баннера до 240 символов.'),'🏷 Название':('title','Введи название до 64 символов.'),'💬 Контакт поддержки':('support','Введи @username поддержки или «-».')}
 def summary():
     c=read_config()
-    return f"Название: {c['title']}\nБаннер: {c['banner']}\nПоддержка: {c['support'] or 'не задана'}\nДоступ: бесплатный\nID группы: {GROUP_ID or 'не настроен'}"
+    return f"Название: {c['title']}\nБаннер: {c['banner']}\nПоддержка: {c['support'] or 'не задана'}\nДоступ: бесплатный\nКанал: {GROUP_ID}\nТекст подписки: {c['access_text']}"
 def handle(msg):
     chat=msg.get('chat',{});uid=msg.get('from',{}).get('id');text=msg.get('text','').strip();command=text.split()[0].split('@')[0] if text else ''
     if chat.get('type') in ('group','supergroup'):
+        if command=='/connect' and uid and not msg.get('sender_chat') and not msg.get('from',{}).get('is_bot'):
+            try:
+                connect_group(uid,chat,text.partition(' ')[2].strip());send(chat['id'],'✅ Группа подключена. Новые подборки будут приходить сюда.')
+                try:send(uid,'✅ Группа подключена: '+destination(uid)['title'])
+                except Exception:pass
+            except ValueError as e:send(chat['id'],str(e))
+            return
         if command=='/groupid' and uid in ADMIN_IDS:send(chat['id'],f"GROUP_ID: {chat['id']}")
         return
     if chat.get('type')!='private':return
     chat=chat['id']
     if command=='/start':
         pending.pop(uid,None);home(chat) if gate(chat,uid) else None;return
+    if command in ('/delivery','/private'):
+        if not gate(chat,uid):return
+        if command=='/private':private_destination(uid)
+        delivery_menu(uid);return
     if command=='/find':
         if not gate(chat,uid):return
         try:
@@ -249,7 +358,7 @@ def handle(msg):
             elif re.fullmatch(r'@[A-Za-z0-9_]{5,32}',text):value=text
             else:raise ValueError('Нужен @username или «-»')
         else:
-            limit={'title':64,'welcome':500,'button_text':48,'banner':240}[key]
+            limit={'title':64,'welcome':500,'button_text':48,'banner':240,'access_text':500}[key]
             if not 1<=len(text)<=limit:raise ValueError(f'От 1 до {limit} символов')
             value=text
         change(key,value)
