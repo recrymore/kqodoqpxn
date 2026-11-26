@@ -1,12 +1,16 @@
 name: See API Check
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 3
+
     steps:
       - name: Check See.tg API
         env:
@@ -14,7 +18,11 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import json, os, sys, time
+          import json
+          import os
+          import sys
+          import time
+
           from urllib.request import Request, build_opener, HTTPRedirectHandler
           from urllib.error import HTTPError, URLError
 
@@ -22,32 +30,70 @@ jobs:
               def redirect_request(self, req, fp, code, msg, headers, newurl):
                   return None
 
-          token = os.environ.get('SEE_API_KEY', '').strip()
+          token = os.environ.get("SEE_API_KEY", "").strip()
+
           if not token:
-              sys.exit('SEE_API_KEY is missing or empty')
+              sys.exit("ERROR: SEE_API_KEY is missing")
+
+          print("SEE_API_KEY: configured")
+          print("Starting See.tg API diagnostics")
+
           opener = build_opener(NoRedirect())
-          for method in ('ping', 'me'):
-              req = Request('https://kartoshka.free/v1/' + method,
-                            headers={'Authorization': 'Bearer ' + token,
-                                     'Accept': 'application/json'})
+
+          for method in ("ping", "me"):
+              url = "https://kartoshka.free/v1/" + method
+
+              print(f"\nChecking endpoint: {method}")
+
+              req = Request(
+                  url,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/json"
+                  }
+              )
+
               try:
                   with opener.open(req, timeout=20) as response:
-                      print(f'{method}: HTTP {response.status}', flush=True)
+                      print(f"HTTP status: {response.status}")
+
                       data = json.load(response)
-                      if not isinstance(data, dict) or data.get('ok') is not True:
-                          sys.exit(f'{method}: unexpected API response')
-                      print(f'{method}: OK', flush=True)
-                      for key in ('X-Free-Remaining', 'X-Request-Cost', 'X-Balance', 'X-RateLimit-Limit', 'X-RateLimit-Remaining'):
+
+                      if not isinstance(data, dict) or data.get("ok") is not True:
+                          sys.exit("Unexpected API response")
+
+                      print(f"{method}: OK")
+
+                      for key in (
+                          "X-Free-Remaining",
+                          "X-Request-Cost",
+                          "X-Balance",
+                          "X-RateLimit-Limit",
+                          "X-RateLimit-Remaining"
+                      ):
                           value = response.headers.get(key)
+
                           if value is not None:
                               try:
-                                  print(f'{key}: {float(value):g}', flush=True)
+                                  print(f"{key}: {float(value):g}")
                               except ValueError:
                                   pass
+
               except HTTPError as exc:
-                  sys.exit(f'{method}: HTTP {exc.code}; check API access or limits')
+                  print("\n--- HTTP ERROR ---")
+                  print(f"Endpoint: {method}")
+                  print(f"HTTP status: {exc.code}")
+                  print(f"Server: {exc.headers.get('Server')}")
+                  print(f"Content-Type: {exc.headers.get('Content-Type')}")
+                  print(f"CF-Ray: {exc.headers.get('CF-Ray')}")
+                  print(f"Retry-After: {exc.headers.get('Retry-After')}")
+                  print("------------------")
+                  sys.exit(1)
+
               except (URLError, TimeoutError, ValueError):
-                  sys.exit(f'{method}: network or JSON error')
+                  sys.exit("ERROR: Network or JSON error")
+
               time.sleep(1.1)
-          print('See API connection OK', flush=True)
+
+          print("\nSee API connection OK")
           PY
