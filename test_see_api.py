@@ -78,6 +78,23 @@ class SeeTests(unittest.TestCase):
             self.assertEqual(self.c.single('PlushPepe-1')['public_username'],'@example_owner')
             data['owner']['seeType']='hidden';self.assertNotIn('public_username',self.c.single('PlushPepe-1'))
         self.assertFalse(self.c.cache)
+    def test_nested_public_owner_single_only(self):
+        data={'gift':raw(),'estimate':{'ton':15}}
+        with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
+            self.assertEqual(self.c.single('PlushPepe-1')['public_username'],'@example_owner')
+        self.assertNotIn('public_username',see_api.normalize(data))
+        self.assertFalse(self.c.cache)
+    def test_nested_hidden_and_conflicting_owner(self):
+        data={'gift':raw()}
+        with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
+            data['owner']={'seeType':'hidden'}
+            self.assertNotIn('public_username',self.c.single('PlushPepe-1'))
+            data.pop('owner');data['gift']['owner']['seeType']='hidden'
+            self.assertNotIn('public_username',self.c.single('PlushPepe-1'))
+    def test_nested_missing_username(self):
+        data={'gift':raw()};data['gift']['owner'].pop('username')
+        with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
+            self.assertNotIn('public_username',self.c.single('PlushPepe-1'))
     def test_admin_boundary(self):
         with patch.object(app,'ADMIN_IDS',{99}),patch.object(see_api,'enabled',return_value=True),patch.object(see_api.client,'search',return_value=[]) as api,patch.object(app,'random_gifts',return_value=[]) as old:
             app.search_gifts(123,10);api.assert_not_called();old.assert_called_once_with(10)

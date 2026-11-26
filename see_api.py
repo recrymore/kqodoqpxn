@@ -179,9 +179,20 @@ class Client:
             raise GiftError('Источник данных: получена карточка другого подарка.')
         log.info('gift card schema accepted')
         # Single, explicit inspection in admin private chat only; never cached/exported in batches.
-        owner=raw.get('owner')
-        if isinstance(owner,dict) and owner.get('seeType')=='public' and owner.get('telegramType')=='user':
+        gift=raw.get('gift')
+        containers=(raw, gift) if isinstance(gift,dict) else (raw,)
+        owners=[level['owner'] for level in containers if level.get('owner') is not None]
+        names=[]
+        for owner in owners:
+            if not isinstance(owner,dict) or owner.get('seeType')!='public' or owner.get('telegramType')!='user':
+                break
             u=owner.get('username')
-            if isinstance(u,str) and re.fullmatch(r'[A-Za-z0-9_]{4,32}',u):item['public_username']='@'+u
+            if not isinstance(u,str) or not re.fullmatch(r'[A-Za-z0-9_]{4,32}',u):
+                break
+            names.append(u)
+        else:
+            if names and len({name.casefold() for name in names})==1:
+                item['public_username']='@'+names[0]
+        log.info('public owner display=%s', 'available' if 'public_username' in item else 'unavailable')
         return item
 client=Client()

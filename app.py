@@ -186,9 +186,28 @@ def gate(chat,uid):
     if status.get('reason')=='verification_failed':text+='\n\n⚠️ Проверка временно недоступна. Попробуй ещё раз.'
     send(chat,text,ik([[('✦ Подписаться на Zergow NFT',GROUP_URL)],[('✓ Проверить подписку','check')]]));return False
 
-def gift_pack(items,mode):
+DATA_CREDIT = 'Данные: https://see.tg'
+credit_in_description = False
+
+def ensure_data_credit():
+    # Preserve the current bot description; fail closed if attribution cannot be moved.
+    try:
+        description = api('getMyDescription').get('description', '')
+        if DATA_CREDIT in description:
+            return True
+        updated = (description.rstrip() + '\n\n' + DATA_CREDIT).strip()
+        if len(updated) > 512:
+            logging.warning('Bot description has no room for data attribution')
+            return False
+        return api('setMyDescription', description=updated) is True
+    except Exception:
+        logging.warning('Bot description attribution update failed')
+        return False
+
+def gift_pack(items,mode,*,single_card=False):
     title=f'✦ GIFT RADAR | ПОДБОРКА\n━━━━━━━━━━━━━━\n🔎 Найдено подарков: {len(items)} шт.'
-    if any(g.get('source')=='See.tg' for g in items):title+='\nДанные: https://see.tg · оценка не равна цене продажи.'
+    if any(g.get('source')=='See.tg' for g in items):
+        title += '\nОценка не равна цене продажи.' if single_card and credit_in_description else '\n' + DATA_CREDIT + ' · оценка не равна цене продажи.'
     elif mode in PRICE_MODES:title+='\nЦены из каталога администратора; проверь на площадке.'
     if not items:title+='\nСовпадений пока нет. Попробуй другой запрос.'
     def short(value):
@@ -360,7 +379,7 @@ def handle(msg):
         try:
             slug=text.partition(' ')[2].strip().removeprefix('https://t.me/nft/')
             item=see_api.client.single(slug)
-            title,rows=gift_pack([item],'random')
+            title,rows=gift_pack([item],'random',single_card=True)
             title+='\n\nПубличный владелец: '+item.get('public_username','не указан')
             send(chat,title,ik(rows))
         except (GiftError,ValueError) as e:send(chat,str(e))
@@ -425,10 +444,13 @@ def bot_loop():
         except Exception as e:logging.warning('%s',e);time.sleep(3)
 
 def main():
+    global credit_in_description
     if TOKEN:
         if not URL.startswith('https://') or not ADMIN_IDS:raise SystemExit('Set HTTPS WEBAPP_URL and ADMIN_IDS before enabling bot.')
         try:api('setChatMenuButton',menu_button={'type':'web_app','text':read_config()['button_text'],'web_app':{'url':URL+'/'}})
         except Exception as e:logging.warning('%s',e)
+        if see_api.enabled():
+            credit_in_description = ensure_data_credit()
         threading.Thread(target=bot_loop,daemon=True).start()
     else:logging.info('Preview mode: bot disabled')
     port=int(os.environ.get('PORT','8000'));host=os.environ.get('HOST','127.0.0.1');logging.info('Serving %s:%s',host,port)
