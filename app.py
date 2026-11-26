@@ -1,5 +1,7 @@
 """Design-stage Telegram Mini App, standard-library only. Run: python app.py."""
 import copy, json, os, re, threading, time, logging, hmac, hashlib, sqlite3
+from urllib.error import HTTPError
+from gifts import random_gifts, GiftError, COLLECTIONS, validate_filters, matches, fetch_card
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,14 +11,16 @@ ROOT=Path(__file__).resolve().parent
 CONFIG=Path(os.environ.get('CONFIG_PATH',str(ROOT/'config.json')))
 TOKEN=os.environ.get('BOT_TOKEN','')
 URL=os.environ.get('WEBAPP_URL','').rstrip('/')
-ADMIN_IDS={int(x.strip()) for x in os.environ.get('ADMIN_IDS','').split(',') if x.strip()}
-DEFAULT={'title':'Трекер подарков','banner':'@team_example панель тимы для ворка','banner_enabled':True,'tariffs':[{'days':d,'price':None} for d in (1,3,7)],'referral_hours':6,'support':'','version':1,'welcome':'Открой трекер кнопкой ниже.','button_text':'Открыть трекер'}
+ADMIN_IDS={8677315356}
+GROUP_ID=os.environ.get('GROUP_ID','').strip()
+GROUP_URL=os.environ.get('GROUP_URL','https://t.me/+DxLz5PTGdiRlZjVi')
+DEFAULT={'title':'Gift Radar • Discover','banner':'Бесплатный трекер подарков','banner_enabled':True,'support':'','version':1,'welcome':'Открой трекер и найди случайные подарки. Доступ бесплатный для участников группы.','button_text':'Открыть трекер'}
 lock=threading.RLock(); pending={}
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 def read_config():
     with lock:
         if not CONFIG.exists(): return copy.deepcopy(DEFAULT)
-        return {**copy.deepcopy(DEFAULT), **json.loads(CONFIG.read_text(encoding='utf-8'))}
+        return {**copy.deepcopy(DEFAULT), **{k:v for k,v in json.loads(CONFIG.read_text(encoding='utf-8')).items() if k in DEFAULT}}
 def change(key,value):
     with lock:
         c=read_config(); c[key]=value;c['version']+=1
@@ -24,26 +28,13 @@ def change(key,value):
         temp=CONFIG.with_suffix('.tmp');temp.write_text(json.dumps(c,ensure_ascii=False,indent=2),encoding='utf-8');temp.replace(CONFIG)
         return c
 
-def parse_tariffs(text):
-    result=[]; seen=set()
-    for line in text.splitlines():
-        if not line.strip(): continue
-        parts=line.replace(':',' ').split()
-        if len(parts)!=2: raise ValueError('Каждая строка: дни цена')
-        d=int(parts[0]);p=parts[1].replace(',','.')
-        if not re.fullmatch(r'\d{1,9}(?:\.\d{1,9})?',p): raise ValueError('Цена должна быть положительным числом, до 9 знаков после точки')
-        amount=Decimal(p)
-        if not 1<=d<=3650 or d in seen or amount<=0: raise ValueError('Уникальный срок от 1 до 3650 дней, цена больше нуля')
-        seen.add(d);result.append({'days':d,'price':format(amount.normalize(),'f')})
-    if not 1<=len(result)<=20: raise ValueError('От 1 до 20 тарифов')
-    return sorted(result,key=lambda x:x['days'])
-
 DB=Path(os.environ.get('DB_PATH',str(ROOT/'tracker.sqlite3')))
 def db():
     DB.parent.mkdir(parents=True,exist_ok=True)
     conn=sqlite3.connect(DB,timeout=10)
     conn.row_factory=sqlite3.Row
     conn.execute('CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY, uid INTEGER NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, created INTEGER NOT NULL, reply TEXT, replied INTEGER)')
+    conn.execute('CREATE TABLE IF NOT EXISTS lots (slug TEXT PRIMARY KEY, price_milli INTEGER NOT NULL, card TEXT NOT NULL, updated INTEGER NOT NULL)')
     return conn
 
 def verify_init(raw):
@@ -89,13 +80,73 @@ def answer_ticket(tid,reply):
     except Exception: return False
     return True
 
+def membership(uid):
+    if not GROUP_ID: return {'member':False,'reason':'group_not_configured'}
+    try:
+        m=api('getChatMember',chat_id=int(GROUP_ID),user_id=uid)
+        ok=m.get('status') in ('creator','administrator','member') or (m.get('status')=='restricted' and m.get('is_member') is True)
+        return {'member':bool(ok),'reason':'ok' if ok else 'not_member'}
+    except Exception:
+        return {'member':False,'reason':'verification_failed'}
+
+PRICE_MODES={'low':(0,5000),'mid':(5000,20000),'high':(20000,1000000),'all':(0,1000000)}
+def price_gifts(mode):
+    if mode not in PRICE_MODES:raise ValueError('Неизвестный диапазон.')
+    low,high=PRICE_MODES[mode]
+    with db() as c:
+        rows=c.execute('SELECT * FROM lots WHERE price_milli>=? AND price_milli<? AND updated>=? ORDER BY RANDOM() LIMIT 9',(low,high,int(time.time())-86400)).fetchall()
+    return [{**json.loads(r['card']),'price_ton':r['price_milli']/1000,'price_source':'admin','updated':r['updated']} for r in rows]
+
+def set_lot(slug,amount):
+    if not re.fullmatch(r'[A-Za-z]+-[1-9][0-9]{0,8}',slug) or slug.split('-')[0] not in COLLECTIONS:raise ValueError('Неверный номер подарка.')
+    try:
+        value=Decimal(amount);milli=value*1000
+        if not value.is_finite() or not 0<value<1000 or milli!=milli.to_integral_value():raise ValueError('Цена: 0–999.999 TON, до 3 знаков.')
+    except InvalidOperation:raise ValueError('Неверная цена.') from None
+    card=fetch_card(slug)
+    if not card:raise ValueError('Публичная карточка не найдена.')
+    with db() as c:c.execute('INSERT OR REPLACE INTO lots VALUES(?,?,?,?)',(slug,int(milli),json.dumps(card,ensure_ascii=False),int(time.time())))
+
+def ik(rows):return {'inline_keyboard':[[{'text':label,**({'url':value} if value.startswith('https://') else {'callback_data':value})} for label,value in row] for row in rows]}
+def home(chat):
+    c=read_config();send(chat,c['title']+'\n'+c['welcome'],{'inline_keyboard':[[{'text':'🎲 Случайные подарки','callback_data':'random'},{'text':'💎 По цене','callback_data':'prices'}],[{'text':'🎛 Фильтры','callback_data':'filters'}],[{'text':c['button_text'],'web_app':{'url':URL+'/'}}]]})
+def gate(chat,uid):
+    if membership(uid)['member']:return True
+    send(chat,'Для бесплатного доступа вступи в группу и подтверди участие.',ik([[('Вступить',GROUP_URL)],[('Проверить','check')]]));return False
+
+def show_gifts(chat,items,mode):
+    title=f'🔎 Найдено: {len(items)}'
+    if not items:title+='\nСовпадений пока нет. Попробуй другой запрос.'
+    if mode in PRICE_MODES:title+='\nЦены из каталога администратора, проверь на площадке.'
+    for i,g in enumerate(items,1):
+        title+=f"\n\n{i}. {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+f"\n{g['model']} · {g['backdrop']} · {g['symbol']}"
+    rows=[[(f"{i}. Открыть NFT",g['url'])] for i,g in enumerate(items,1)]
+    rows.append([('🎛 Изменить фильтры' if mode=='filters' else '↻ Новая подборка',mode),('← Меню','home')]);send(chat,title,ik(rows))
+
+def callback(q):
+    api('answerCallbackQuery',callback_query_id=q['id'])
+    msg=q.get('message',{});chat=msg.get('chat',{});uid=q.get('from',{}).get('id');action=q.get('data','')
+    if chat.get('type')!='private' or chat.get('id')!=uid:return
+    chat=chat['id']
+    if action=='home':home(chat);return
+    if not gate(chat,uid):return
+    if action=='check':home(chat)
+    elif action=='prices':send(chat,'💎 Выбери бюджет в TON.\nДо 5 · 5–20 · 20–999.999',ik([[('До 5','low'),('5–20','mid')],[('20+','high'),('Все цены','all')],[('← Меню','home')]]))
+    elif action=='filters':send(chat,'🎛 Фильтры по атрибутам\nВведи, например: /find model=Steel; backdrop=Black; symbol=Star\nКоллекции: '+', '.join(COLLECTIONS)+'\nЛюбое поле можно пропустить.',ik([[('← Меню','home')]]))
+    elif action=='random' or action in PRICE_MODES:
+        try:show_gifts(chat,random_gifts(3) if action=='random' else price_gifts(action),action)
+        except GiftError as e:send(chat,str(e))
+
+def public_config():
+    return {**read_config(),'group_url':GROUP_URL}
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path=urlsplit(self.path).path
         if path in ('/','/index.html'):
             data=(ROOT/'index.html').read_bytes();typ='text/html; charset=utf-8'
         elif path=='/api/config':
-            data=json.dumps(read_config(),ensure_ascii=False).encode();typ='application/json; charset=utf-8'
+            data=json.dumps(public_config(),ensure_ascii=False).encode();typ='application/json; charset=utf-8'
         elif path=='/health':
             data=b'ok';typ='text/plain'
         else:self.send_error(404);return
@@ -105,7 +156,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def do_POST(self):
         path=urlsplit(self.path).path
-        if path not in ('/api/me','/api/tickets','/api/ticket'): self.json_response(404,{'error':'Не найдено'});return
+        if path not in ('/api/me','/api/tickets','/api/ticket','/api/random','/api/prices'): self.json_response(404,{'error':'Не найдено'});return
         try:
             length=int(self.headers.get('Content-Length','0'))
             if not 0<length<=32768: raise ValueError('Недопустимый размер запроса')
@@ -115,10 +166,16 @@ class Handler(BaseHTTPRequestHandler):
         try: uid=verify_init(data.get('initData'))
         except (ValueError,TypeError,KeyError): self.json_response(401,{'error':'Открой Mini App заново в Telegram'});return
         try:
-            if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS}
+            if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,**membership(uid)}
+            elif path in ('/api/random','/api/prices'):
+                status=membership(uid)
+                if not status['member']:
+                    self.json_response(403,{'error':'Вступи в группу или повтори проверку доступа.','reason':status['reason']});return
+                result={'gifts':price_gifts(data.get('mode','all')) if path=='/api/prices' else (random_gifts(data.get('count',3),data['filters']) if 'filters' in data else random_gifts(data.get('count',3)))}
             elif path=='/api/tickets':result={'tickets':tickets(uid)}
             else:result={'id':new_ticket(uid,data.get('kind'),data.get('body'))}
             self.json_response(200,result)
+        except GiftError as e:self.json_response(503,{'error':str(e)})
         except ValueError as e:self.json_response(400,{'error':str(e)})
         except Exception:logging.exception('Support request failed');self.json_response(500,{'error':'Ошибка сервера'})
     def log_message(self,*args): pass
@@ -135,19 +192,36 @@ def send(chat,text,markup=None):
     kw={'chat_id':chat,'text':text}
     if markup:kw['reply_markup']=markup
     return api('sendMessage',**kw)
-MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'💰 Тарифы и цены'}],[{'text':'👁 Показать / скрыть баннер'},{'text':'🏷 Название'}],[{'text':'🎁 Реферальный бонус'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'Отмена'}]],'resize_keyboard':True,'one_time_keyboard':False}
-OPTIONS={'👋 Приветствие':('welcome','Введи текст приветствия до 500 символов.'),'🔘 Кнопка запуска':('button_text','Введи подпись кнопки до 48 символов.'),'✏️ Верхний баннер':('banner','Введи новый текст баннера (до 240 символов). @username станет ссылкой.'),'💰 Тарифы и цены':('tariffs','Отправь тарифы: каждая строка — срок в днях и цена GRAM. Например:\n1 100\n3 220\n7 400\nЭто только пример.'),'🏷 Название':('title','Введи новое название (до 64 символов).'),'🎁 Реферальный бонус':('referral_hours','Введи число часов от 0 до 720.'),'💬 Контакт поддержки':('support','Введи @username поддержки или «-», чтобы убрать контакт.')}
+MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'👁 Показать / скрыть баннер'}],[{'text':'🏷 Название'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'Отмена'}]],'resize_keyboard':True}
+OPTIONS={'👋 Приветствие':('welcome','Введи приветствие до 500 символов.'),'🔘 Кнопка запуска':('button_text','Введи подпись кнопки до 48 символов.'),'✏️ Верхний баннер':('banner','Введи текст баннера до 240 символов.'),'🏷 Название':('title','Введи название до 64 символов.'),'💬 Контакт поддержки':('support','Введи @username поддержки или «-».')}
 def summary():
-    c=read_config(); tariffs='\n'.join(f"{t['days']} дн. — {t['price'] if t['price'] is not None else 'не задано'} GRAM" for t in c['tariffs'])
-    return f"Название: {c['title']}\nБаннер: {'вкл.' if c['banner_enabled'] else 'выкл.'}\n{c['banner']}\n\nТарифы:\n{tariffs}\n\nРеферальный бонус: {c['referral_hours']} ч.\nПоддержка: {c['support'] or 'не задана'}"
+    c=read_config()
+    return f"Название: {c['title']}\nБаннер: {c['banner']}\nПоддержка: {c['support'] or 'не задана'}\nДоступ: бесплатный\nID группы: {GROUP_ID or 'не настроен'}"
 def handle(msg):
-    if msg.get('chat',{}).get('type')!='private':return
-    chat=msg['chat']['id'];uid=msg.get('from',{}).get('id');text=msg.get('text','').strip();command=text.split()[0].split('@')[0] if text else ''
-    if command=='/start':
-        pending.pop(uid,None);c=read_config();send(chat,c['title']+'\n'+c['welcome'],{'inline_keyboard':[[{'text':c['button_text'],'web_app':{'url':URL+'/'} }]]});return
-    if uid not in ADMIN_IDS:
-        if command=='/admin':send(chat,'Нет доступа.')
+    chat=msg.get('chat',{});uid=msg.get('from',{}).get('id');text=msg.get('text','').strip();command=text.split()[0].split('@')[0] if text else ''
+    if chat.get('type') in ('group','supergroup'):
+        if command=='/groupid' and uid in ADMIN_IDS:send(chat['id'],f"GROUP_ID: {chat['id']}")
         return
+    if chat.get('type')!='private':return
+    chat=chat['id']
+    if command=='/start':
+        pending.pop(uid,None);home(chat) if gate(chat,uid) else None;return
+    if command=='/find':
+        if not gate(chat,uid):return
+        try:
+            raw=text.partition(' ')[2];filters=validate_filters(dict(tuple(x.strip().split('=',1)) for x in raw.split(';') if x.strip()))
+            show_gifts(chat,random_gifts(3,filters),'filters')
+        except (ValueError,GiftError) as e:send(chat,'Ошибка поиска: '+str(e))
+        return
+    if uid not in ADMIN_IDS:return
+    if command=='/lot':
+        try:
+            _,slug,price=text.split();set_lot(slug,price);send(chat,'Цена добавлена на 24 часа.')
+        except (ValueError,GiftError) as e:send(chat,'Формат: /lot PlushPepe-123 4.5\n'+str(e))
+        return
+    if command=='/unlot':
+        with db() as c:c.execute('DELETE FROM lots WHERE slug=?',(text.partition(' ')[2].strip(),))
+        send(chat,'Удалено из каталога.');return
     if command=='/reply':
         parts=text.split(maxsplit=2)
         try:
@@ -160,7 +234,7 @@ def handle(msg):
         if not rows:send(chat,'Нет открытых обращений.',MENU)
         for r in rows:send(chat,f"#{r['id']} · {r['kind']}\n{r['body']}\n/reply {r['id']} текст")
         return
-    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением и тарифами',MENU);return
+    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением\nКаталог: /lot slug цена_TON; /unlot slug',MENU);return
     if command=='/cancel' or text=='Отмена':pending.pop(uid,None);send(chat,'Изменение отменено.',MENU);return
     if text in OPTIONS:
         key,prompt=OPTIONS[text];pending[uid]=key;send(chat,prompt,{'keyboard':[[{'text':'Отмена'}]],'resize_keyboard':True});return
@@ -170,11 +244,7 @@ def handle(msg):
     key=pending.get(uid)
     if not key:return
     try:
-        if key=='tariffs':value=parse_tariffs(text)
-        elif key=='referral_hours':
-            value=int(text)
-            if not 0<=value<=720:raise ValueError('Допустимо 0–720 часов')
-        elif key=='support':
+        if key=='support':
             if text=='-':value=''
             elif re.fullmatch(r'@[A-Za-z0-9_]{5,32}',text):value=text
             else:raise ValueError('Нужен @username или «-»')
@@ -186,17 +256,19 @@ def handle(msg):
         if key=='button_text' and TOKEN:
             try:api('setChatMenuButton',menu_button={'type':'web_app','text':value,'web_app':{'url':URL+'/'}})
             except Exception:logging.warning('Menu button update failed')
-    except (ValueError,InvalidOperation) as e:send(chat,'Не сохранено: '+str(e));return
+    except ValueError as e:send(chat,'Не сохранено: '+str(e));return
     pending.pop(uid,None);send(chat,'✅ Сохранено. Mini App обновит настройки автоматически.',MENU)
 
 def bot_loop():
     offset=None
     while True:
         try:
-            params={'timeout':25,'allowed_updates':['message']}
+            params={'timeout':25,'allowed_updates':['message','callback_query']}
             if offset is not None:params['offset']=offset
             for update in api('getUpdates',**params):
-                try:handle(update.get('message',{}))
+                try:
+                    if 'callback_query' in update:callback(update['callback_query'])
+                    else:handle(update.get('message',{}))
                 except Exception as e:logging.warning('Update failed: %s',type(e).__name__)
                 offset=update['update_id']+1
         except Exception as e:logging.warning('%s',e);time.sleep(3)
