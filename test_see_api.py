@@ -13,6 +13,34 @@ class SeeTests(unittest.TestCase):
         item=see_api.normalize(raw());self.assertEqual(item['estimate_ton'],12.5);self.assertEqual(item['model'],'Steel');self.assertNotIn('owner',item);self.assertNotIn('example_owner',str(item))
     def test_details(self):
         item=see_api.normalize({'details':raw(),'estimate':{'ton':15}});self.assertEqual(item['slug'],'PlushPepe-1');self.assertEqual(item['estimate_ton'],15)
+    def test_split_slug(self):
+        data={'details':{'slug':'PlushPepe','num':1,'title':'Plush Pepe','model':'Steel','backdrop':'Black','pattern':'Star'},'estimate':{'ton':15}}
+        item=see_api.normalize(data)
+        self.assertEqual(item['slug'],'PlushPepe-1')
+        self.assertEqual(item['url'],'https://t.me/nft/PlushPepe-1')
+        self.assertEqual(item['estimate_ton'],15)
+        self.assertEqual(see_api.normalize({'slug':'JellyBunny','num':'25'})['number'],25)
+        self.assertIsNone(see_api.normalize({'slug':'PlushPepe','num':True}))
+        self.assertIsNone(see_api.normalize({'slug':'PlushPepe-1','num':2}))
+        self.assertIsNone(see_api.normalize({'slug':'PlushPepe'}))
+    def test_single_split_slug_and_mismatch(self):
+        data={'details':{'slug':'PlushPepe','num':1,'title':'Plush Pepe'}}
+        with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
+            self.assertEqual(self.c.single('PlushPepe-1')['slug'],'PlushPepe-1')
+            with self.assertRaises(GiftError):self.c.single('PlushPepe-2')
+    def test_schema_logs_without_values(self):
+        data={'details':{'slug':'private-value','num':'invalid'},'owner':{'username':'private_owner'}}
+        with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
+            with self.assertLogs('see',level='WARNING') as logs:
+                with self.assertRaises(GiftError):self.c.single('PlushPepe-1')
+            output=str(logs.output)
+            self.assertIn('details.slug_format',output)
+            self.assertNotIn('private-value',output)
+            self.assertNotIn('private_owner',output)
+    def test_split_slug_batch(self):
+        data={'items':[{'slug':'PlushPepe','num':1},{'slug':'PlushPepe','num':2}]}
+        with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
+            self.assertEqual({x['slug'] for x in self.c.search(10)},{'PlushPepe-1','PlushPepe-2'})
     def test_cache_and_batch(self):
         data={'items':[raw(i) for i in range(1,61)]+[raw(1)]}
         with patch.object(self.c,'_free') as quota,patch.object(self.c,'_request',return_value=data) as request:

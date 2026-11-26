@@ -11,6 +11,42 @@ from gifts import GiftError
 BASE = 'https://kartoshka.free/v1/'
 MAX_BATCH = 50
 SLUG = re.compile(r'[A-Za-z][A-Za-z0-9]{0,80}-[1-9][0-9]{0,9}')
+COLLECTION_SLUG = re.compile(r'[A-Za-z][A-Za-z0-9]{0,80}')
+
+def gift_number(value):
+    if type(value) is int and 1 <= value <= 9999999999:
+        return str(value)
+    if isinstance(value, str) and re.fullmatch(r'[1-9][0-9]{0,9}', value):
+        return value
+    return None
+
+def gift_ref(slug, num):
+    if not isinstance(slug, str):
+        return None
+    slug = slug.strip()
+    number = gift_number(num)
+    if SLUG.fullmatch(slug):
+        if num is not None and number != slug.rsplit('-', 1)[1]:
+            return None
+        return slug
+    if COLLECTION_SLUG.fullmatch(slug) and number is not None:
+        return slug + '-' + number
+    return None
+
+def card_shape(raw):
+    # Log only fixed field names and types, never API values or owner information.
+    if not isinstance(raw, dict):
+        return {'result': type(raw).__name__}
+    result = {}
+    for label, data in [('result', raw), ('details', raw.get('details'))]:
+        result[label] = type(data).__name__
+        if isinstance(data, dict):
+            for key in ('slug', 'num', 'title', 'model', 'backdrop', 'pattern', 'estimate'):
+                result[label + '.' + key] = type(data[key]).__name__ if key in data else 'missing'
+                if key == 'slug':
+                    value = data.get(key)
+                    result[label + '.slug_format'] = ('full' if isinstance(value, str) and SLUG.fullmatch(value.strip()) else 'collection' if isinstance(value, str) and COLLECTION_SLUG.fullmatch(value.strip()) else 'unknown')
+    return result
 log = logging.getLogger('see')
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
@@ -36,8 +72,8 @@ def normalize(raw):
     details=raw.get('details') if isinstance(raw.get('details'),dict) else {}
     # Only whitelisted gift fields cross the adapter boundary.
     def field(k): return raw.get(k) if raw.get(k) is not None else details.get(k)
-    slug=field('slug')
-    if not isinstance(slug,str) or not SLUG.fullmatch(slug): return None
+    slug=gift_ref(field('slug'), field('num'))
+    if slug is None: return None
     est=raw.get('estimate') if isinstance(raw.get('estimate'),dict) else {}
     item={'slug':slug,'name':clean(field('title')),'number':int(slug.rsplit('-',1)[1]),'url':'https://t.me/nft/'+slug,'model':clean(field('model')),'backdrop':clean(field('backdrop')),'symbol':clean(field('pattern')),'source':'See.tg','on_sale':field('onSale') is True}
     for k,target in [('ton','estimate_ton'),('low','estimate_low'),('high','estimate_high')]:
@@ -106,6 +142,10 @@ class Client:
                 self._free();data=self._request('gifts',params)
                 if not isinstance(data,dict) or not isinstance(data.get('items'),list):raise GiftError('Источник данных: неизвестная структура списка.')
                 items=list({g['slug']:g for x in data['items'] if (g:=normalize(x))}.values())
+                log.info('gift batch returned=%s recognized=%s', len(data['items']), len(items))
+                if data['items'] and not items:
+                    log.warning('gift batch schema rejected: %s', card_shape(data['items'][0]))
+                    raise GiftError('Источник данных: структура списка подарков не распознана.')
                 if len(self.cache)>=32:self.cache.pop(next(iter(self.cache)))
                 self.cache[key]=(time.monotonic(),items)
         return random.sample(items,min(count,len(items)))
@@ -114,7 +154,12 @@ class Client:
         with self.lock:
             self._free();raw=self._request('gift/'+slug)
         item=normalize(raw)
-        if item is None:raise GiftError('Источник данных: структура карточки не распознана.')
+        if item is None:
+            log.warning('gift card schema rejected: %s', card_shape(raw))
+            raise GiftError('Источник данных: структура карточки не распознана. Проверь логи запуска (gift card schema rejected).')
+        if item['slug'].casefold() != slug.casefold():
+            log.warning('gift card identifier mismatch')
+            raise GiftError('Источник данных: получена карточка другого подарка.')
         # Single, explicit inspection in admin private chat only; never cached/exported in batches.
         owner=raw.get('owner')
         if isinstance(owner,dict) and owner.get('seeType')=='public' and owner.get('telegramType')=='user':
