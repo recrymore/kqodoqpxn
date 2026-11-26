@@ -3,6 +3,7 @@ import copy, json, os, re, threading, time, logging, hmac, hashlib, sqlite3, sec
 from contextlib import contextmanager
 from urllib.error import HTTPError
 from gifts import random_gifts, GiftError, COLLECTIONS, validate_filters, matches, fetch_card, MAX_BATCH
+import see_api
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -98,6 +99,14 @@ def membership(uid):
         return {'member':False,'reason':'verification_failed'}
 
 PRICE_MODES={'low':(0,5000),'mid':(5000,20000),'high':(20000,1000000),'all':(0,1000000)}
+def see_enabled(uid):
+    return uid in ADMIN_IDS and see_api.enabled()
+
+def search_gifts(uid,count=MAX_BATCH,filters=None,mode=None):
+    if see_enabled(uid):return see_api.client.search(count,filters,mode)
+    if mode is not None:return price_gifts(mode)
+    return random_gifts(count,filters) if filters is not None else random_gifts(count)
+
 def price_gifts(mode):
     if mode not in PRICE_MODES:raise ValueError('Неизвестный диапазон.')
     low,high=PRICE_MODES[mode]
@@ -179,35 +188,40 @@ def gate(chat,uid):
 
 def gift_pack(items,mode):
     title=f'✦ GIFT RADAR | ПОДБОРКА\n━━━━━━━━━━━━━━\n🔎 Найдено подарков: {len(items)} шт.'
-    if mode in PRICE_MODES:title+='\nЦены из каталога администратора; проверь на площадке.'
+    if any(g.get('source')=='See.tg' for g in items):title+='\nИсточник: See.tg · оценка не равна цене продажи.'
+    elif mode in PRICE_MODES:title+='\nЦены из каталога администратора; проверь на площадке.'
     if not items:title+='\nСовпадений пока нет. Попробуй другой запрос.'
     def short(value):
         value=str(value)
         return value if len(value)<=60 else value[:59]+'…'
     for i,g in enumerate(items,1):
-        title+=f"\n\n{i:02d} ┃ {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+f"\n{short(g['model'])} · {short(g['backdrop'])} · {short(g['symbol'])}"
+        title+=f"\n\n{i:02d} ┃ {g['name']} #{g['number']}"+(f" · {g['price_ton']:g} TON" if 'price_ton' in g else '')+(f" · оценка {g['estimate_ton']:.2f} TON" if 'estimate_ton' in g else '')+f"\n{short(g['model'])} · {short(g['backdrop'])} · {short(g['symbol'])}"
     rows=[[(f"{i:02d} · Владелец / NFT",g['url']),("Копировать ссылку",{'copy_text':{'text':g['url']}})] for i,g in enumerate(items,1)]
     return title,rows
 
 def deliver_gifts(uid,items,mode):
-    title,rows=gift_pack(items,mode)
     menu=[('🎛 Изменить фильтры' if mode=='filters' else '↻ Новая подборка',mode),('← Меню','home')]
     if not items:return {'kind':'empty'}
-    # Re-check access immediately before sending, not only before searching.
     if not membership(uid)['member']:return {'kind':'blocked'}
     d=destination(uid)
-    if d['kind']=='group':
-        try:
-            if not group_allowed(uid,d['chat_id']):raise ValueError('Группа недоступна')
-            # Group gets only gift URL and clipboard buttons, no user-specific actions.
-            send(d['chat_id'],title,ik(rows))
-        except Exception:
-            title+='\n\n⚠️ Не удалось подтвердить доставку в группу. Подборка отправлена сюда.'
-        else:
-            return {'kind':'group','title':d['title']}
-    try:send(uid,title,ik(rows+[menu]))
-    except Exception:return {'kind':'failed'}
-    return {'kind':'private','fallback':d['kind']=='group'}
+    group=d['kind']=='group'
+    if group:
+        try:group=group_allowed(uid,d['chat_id'])
+        except Exception:group=False
+    fallback=d['kind']=='group' and not group
+    # Telegram text and keyboard limits: deliver bounded chunks, not one 50-item message.
+    chunks=[items[i:i+10] for i in range(0,len(items),10)]
+    for i,part in enumerate(chunks,1):
+        title,rows=gift_pack(part,mode)
+        if len(chunks)>1:title+=f'\n\nЧасть {i}/{len(chunks)} · всего {len(items)} NFT'
+        if group:
+            try:send(d['chat_id'],title,ik(rows));continue
+            except Exception:group=False;fallback=True
+        if fallback:title+='\n\n⚠️ Группа недоступна. Эта часть отправлена сюда.'
+        try:send(uid,title,ik(rows+([menu] if i==len(chunks) else [])))
+        except Exception:return {'kind':'failed'}
+    if group:return {'kind':'group','title':d['title']}
+    return {'kind':'private','fallback':fallback}
 
 def show_gifts(chat,items,mode):
     result=deliver_gifts(chat,items,mode)
@@ -228,9 +242,15 @@ def callback(q):
     elif action=='delivery_private':private_destination(uid);delivery_menu(uid)
     elif action=='prices':send(chat,'💎 Выбери бюджет в TON.\nДо 5 · 5–20 · 20–999.999',ik([[('До 5','low'),('5–20','mid')],[('20+','high'),('Все цены','all')],[('← Меню','home')]]))
     elif action=='filters':send(chat,'🎛 Фильтры по атрибутам\nВведи, например: /find model=Steel; backdrop=Black; symbol=Star\nКоллекции: '+', '.join(COLLECTIONS)+'\nЛюбое поле можно пропустить.',ik([[('← Меню','home')]]))
+    elif action=='random' and see_enabled(uid):
+        send(chat,'Выбери размер подборки See.tg (случайная выборка из первой страницы).',ik([[('10 NFT','see_random_10'),('25 NFT','see_random_25'),('50 NFT','see_random_50')],[('← Меню','home')]]))
+    elif action in ('see_random_10','see_random_25','see_random_50'):
+        if not see_enabled(uid):return
+        try:show_gifts(chat,search_gifts(uid,int(action.rsplit('_',1)[1])),'random')
+        except (GiftError,ValueError) as e:send(chat,str(e))
     elif action=='random' or action in PRICE_MODES:
-        try:show_gifts(chat,random_gifts(MAX_BATCH) if action=='random' else price_gifts(action),action)
-        except GiftError as e:send(chat,str(e))
+        try:show_gifts(chat,search_gifts(uid,MAX_BATCH,mode=None if action=='random' else action),action)
+        except (GiftError,ValueError) as e:send(chat,str(e))
 
 def public_config():
     return {**read_config(),'group_url':GROUP_URL}
@@ -261,7 +281,7 @@ class Handler(BaseHTTPRequestHandler):
         try: uid=verify_init(data.get('initData'))
         except (ValueError,TypeError,KeyError): self.json_response(401,{'error':'Открой Mini App заново в Telegram'});return
         try:
-            if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'delivery':destination(uid),**membership(uid)}
+            if path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'see_enabled':see_enabled(uid),'delivery':destination(uid),**membership(uid)}
             elif path=='/api/delivery':
                 if not membership(uid)['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft.'});return
@@ -273,7 +293,7 @@ class Handler(BaseHTTPRequestHandler):
                 status=membership(uid)
                 if not status['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft или повтори проверку подписки.','reason':status['reason']});return
-                result={'gifts':price_gifts(data.get('mode','all')) if path=='/api/prices' else (random_gifts(data.get('count',MAX_BATCH),data['filters']) if 'filters' in data else random_gifts(data.get('count',MAX_BATCH)))}
+                result={'gifts':search_gifts(uid,data.get('count',MAX_BATCH),data.get('filters'),data.get('mode','all') if path=='/api/prices' else None)}
                 result['delivery']=deliver_gifts(uid,result['gifts'],data.get('mode','all') if path=='/api/prices' else ('filters' if 'filters' in data else 'random'))
                 if result['delivery']['kind']=='blocked':
                     self.json_response(403,{'error':'Подписка не подтверждена.'});return
@@ -297,7 +317,7 @@ def send(chat,text,markup=None):
     kw={'chat_id':chat,'text':text}
     if markup:kw['reply_markup']=markup
     return api('sendMessage',**kw)
-MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'👁 Показать / скрыть баннер'}],[{'text':'🏷 Название'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'🔐 Текст подписки'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'Отмена'}]],'resize_keyboard':True}
+MENU={'keyboard':[[{'text':'✏️ Верхний баннер'},{'text':'👁 Показать / скрыть баннер'}],[{'text':'🏷 Название'},{'text':'💬 Контакт поддержки'}],[{'text':'👋 Приветствие'},{'text':'🔘 Кнопка запуска'}],[{'text':'🔐 Текст подписки'}],[{'text':'📥 Обращения'},{'text':'📋 Текущие настройки'}],[{'text':'📊 Квота See.tg'},{'text':'Отмена'}]],'resize_keyboard':True}
 OPTIONS={'🔐 Текст подписки':('access_text','Введи текст просьбы о подписке до 500 символов.'),'👋 Приветствие':('welcome','Введи приветствие до 500 символов.'),'🔘 Кнопка запуска':('button_text','Введи подпись кнопки до 48 символов.'),'✏️ Верхний баннер':('banner','Введи текст баннера до 240 символов.'),'🏷 Название':('title','Введи название до 64 символов.'),'💬 Контакт поддержки':('support','Введи @username поддержки или «-».')}
 def summary():
     c=read_config()
@@ -325,11 +345,26 @@ def handle(msg):
     if command=='/find':
         if not gate(chat,uid):return
         try:
-            raw=text.partition(' ')[2];filters=validate_filters(dict(tuple(x.strip().split('=',1)) for x in raw.split(';') if x.strip()))
-            show_gifts(chat,random_gifts(MAX_BATCH,filters),'filters')
+            raw=text.partition(' ')[2];filters=dict(tuple(x.strip().split('=',1)) for x in raw.split(';') if x.strip())
+            if not see_enabled(uid):filters=validate_filters(filters)
+            show_gifts(chat,search_gifts(uid,MAX_BATCH,filters),'filters')
         except (ValueError,GiftError) as e:send(chat,'Ошибка поиска: '+str(e))
         return
     if uid not in ADMIN_IDS:return
+    if command=='/seequota' or text=='📊 Квота See.tg':
+        try:send(chat,'Остаток бесплатных запросов See.tg: '+str(see_api.client.quota()))
+        except GiftError as e:send(chat,str(e))
+        return
+    if command=='/gift':
+        if not gate(chat,uid):return
+        try:
+            slug=text.partition(' ')[2].strip().removeprefix('https://t.me/nft/')
+            item=see_api.client.single(slug)
+            title,rows=gift_pack([item],'random')
+            title+='\n\nПубличный владелец: '+item.get('public_username','не указан')
+            send(chat,title,ik(rows))
+        except (GiftError,ValueError) as e:send(chat,str(e))
+        return
     if command=='/lot':
         try:
             _,slug,price=text.split();set_lot(slug,price);send(chat,'Цена добавлена на 24 часа.')
@@ -350,7 +385,7 @@ def handle(msg):
         if not rows:send(chat,'Нет открытых обращений.',MENU)
         for r in rows:send(chat,f"#{r['id']} · {r['kind']}\n{r['body']}\n/reply {r['id']} текст")
         return
-    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением\nКаталог: /lot slug цена_TON; /unlot slug',MENU);return
+    if command=='/admin':pending.pop(uid,None);send(chat,'Управление оформлением\nSee.tg (тест владельца): /seequota; /gift PlushPepe-1\nКаталог V7: /lot slug цена_TON; /unlot slug',MENU);return
     if command=='/cancel' or text=='Отмена':pending.pop(uid,None);send(chat,'Изменение отменено.',MENU);return
     if text in OPTIONS:
         key,prompt=OPTIONS[text];pending[uid]=key;send(chat,prompt,{'keyboard':[[{'text':'Отмена'}]],'resize_keyboard':True});return
