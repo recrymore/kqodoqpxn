@@ -61,15 +61,18 @@ class SeeTests(unittest.TestCase):
     def test_split_slug_batch(self):
         data={'items':[{'slug':'PlushPepe','num':1},{'slug':'PlushPepe','num':2}]}
         with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value=data):
-            self.assertEqual({x['slug'] for x in self.c.search(10)},{'PlushPepe-1','PlushPepe-2'})
+            with patch.object(self.c, '_enrich_owner', side_effect=lambda x: x):
+                self.assertEqual({x['slug'] for x in self.c.search(10)},{'PlushPepe-1','PlushPepe-2'})
     def test_cache_and_batch(self):
         data={'items':[raw(i) for i in range(1,61)]+[raw(1)]}
         with patch.object(self.c,'_free') as quota,patch.object(self.c,'_request',return_value=data) as request:
-            self.assertEqual(len(self.c.search(50)),50);self.assertEqual(len(self.c.search(25)),25)
-            quota.assert_called_once();request.assert_called_once();self.assertNotIn('example_owner',str(self.c.cache))
+            with patch.object(self.c, '_enrich_owner', side_effect=lambda x: x):
+                self.assertEqual(len(self.c.search(50)),50);self.assertEqual(len(self.c.search(25)),25)
+                quota.assert_called_once();request.assert_called_once();self.assertNotIn('example_owner',str(self.c.cache))
     def test_filters(self):
         with patch.object(self.c,'_free'),patch.object(self.c,'_request',return_value={'items':[]}) as request:
-            self.c.search(25,{'symbol':'Star'},'mid');params=request.call_args.args[1];self.assertEqual(params['pattern'],'Star');self.assertEqual(params['price_from'],5_000_000_000);self.assertEqual(params['price_to'],19_999_999_999)
+            with patch.object(self.c, '_enrich_owner'):
+                self.c.search(25,{'symbol':'Star'},'mid');params=request.call_args.args[1];self.assertEqual(params['pattern'],'Star');self.assertEqual(params['price_from'],5_000_000_000);self.assertEqual(params['price_to'],19_999_999_999)
         with self.assertRaises(ValueError):self.c.search(25,{'owner':'someone'})
     def test_quota(self):
         with patch.object(self.c,'_request') as request:
@@ -132,4 +135,5 @@ class SeeTests(unittest.TestCase):
         with patch.object(app,'membership',return_value={'member':True}),patch.object(app,'destination',return_value={'kind':'private'}),patch.object(app,'send') as send:
             result=app.deliver_gifts(123,[see_api.normalize(raw(i)) for i in range(1,51)],'random');self.assertEqual(result['kind'],'private');self.assertEqual(send.call_count,5)
             for call in send.call_args_list:self.assertLess(len(call.args[1]),4096)
+
 if __name__=='__main__':unittest.main()
