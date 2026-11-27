@@ -368,6 +368,7 @@ OWNER_MESSAGES={
     'missing_username':'публичный владелец, username не предоставлен',
     'unrecognized':'формат данных владельца не распознан',
     'conflicting_owner':'данные владельца противоречат друг другу',
+    'public_card':'Публичный владелец — смотри в оригинальной карточке Telegram.',
 }
 
 def inspect_one(uid,ref):
@@ -380,11 +381,15 @@ def inspect_one(uid,ref):
         item=see_api.client.single(slug)
         item['owner_display']=item.get('public_username',OWNER_MESSAGES.get(item.get('owner_status'),'не указан'))
     elif see_enabled(uid):
-        item=see_api.client.single(slug, include_owner=False)
+        item=see_api.client.single(slug, include_owner=False, include_owner_status=True)
+        # Do not return contact fields to the shared user interface.
+        item={k:v for k,v in item.items() if k in ('slug','name','number','url','model','backdrop','symbol','source','on_sale','estimate_ton','estimate_low','estimate_high','confidence','owner_status')}
+        item['owner_display']=OWNER_MESSAGES.get(item.get('owner_status'),'Смотри оригинальную карточку Telegram.')
     else:
         if slug.split('-')[0] not in COLLECTIONS:raise ValueError('Коллекция недоступна в базовом источнике. Открой оригинальный подарок.')
         item=fetch_card(slug)
         if not item:raise GiftError('Подарок не найден.')
+        item={**item,'owner_display':'Смотри владельца в оригинальной карточке Telegram, если он открыт.'}
     return item
 
 def deliver_gifts(uid,items,mode,*,origin='bot'):
@@ -726,7 +731,8 @@ def handle(msg):
         try:
             item=inspect_one(uid,text.partition(' ')[2])
             title,rows=gift_pack([item],'random',single_card=True)
-            if 'owner_display' in item:title+='\n\nПубличный владелец: '+item['owner_display']
+            if 'owner_display' in item:title+='\n\nВладелец: '+item['owner_display']
+            if not owner_inspection(uid):rows=[[('🎁 Подарок / владелец',item['url'])]]
             username=item.get('public_username','')
             if item.get('owner_status')=='available' and re.fullmatch(r'@[A-Za-z0-9_]{4,32}',username):
                 rows=[[('🎁 Подарок',item['url']),('💬 ЛС','https://t.me/'+username[1:])]]

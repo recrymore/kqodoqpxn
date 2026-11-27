@@ -224,7 +224,7 @@ class Client:
             log.info('gift diverse sample bands=%s returned=%s',len(pools),len(result))
             return result
 
-    def single(self,slug,*,include_owner=True):
+    def single(self,slug,*,include_owner=True,include_owner_status=False):
         if not isinstance(slug,str) or not SLUG.fullmatch(slug):raise ValueError('Формат: /gift PlushPepe-1')
         with self.lock:
             self._free();raw=self._request('gift/'+slug)
@@ -236,7 +236,19 @@ class Client:
             log.warning('gift card identifier mismatch')
             raise GiftError('Источник данных: получена карточка другого подарка.')
         log.info('gift card schema accepted')
-        if not include_owner:return item
+        if not include_owner:
+            if include_owner_status:
+                # For individual public views, return only visibility, never identifiers.
+                gift=raw.get('gift')
+                levels=(raw,gift) if isinstance(gift,dict) else (raw,)
+                owners=[level['owner'] for level in levels if level.get('owner') is not None]
+                if not owners: status='missing_owner'
+                elif any(not isinstance(o,dict) for o in owners): status='unrecognized'
+                elif any(o.get('seeType')=='hidden' for o in owners): status='hidden'
+                elif all(o.get('seeType')=='public' for o in owners): status='public_card'
+                else: status='not_public'
+                item['owner_status']=status
+            return item
         # Single, explicit inspection in admin private chat only; never cached/exported in batches.
         gift=raw.get('gift')
         containers=(raw, gift) if isinstance(gift,dict) else (raw,)
