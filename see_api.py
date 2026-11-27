@@ -102,7 +102,7 @@ def normalize(raw):
 class Client:
     def __init__(self):
         self.lock=threading.RLock(); self.last=0.; self.blocked=0.; self.cache={}; self.remaining=None
-        self.opener=build_opener(NoRedirect())
+        self.opener=build_opener(NoRedirect()); self.billing=None
     def _request(self,path,params=None):
         token=os.environ.get('SEE_API_KEY','').strip()
         if not token:raise GiftError('Подключение к источнику данных не настроено.')
@@ -111,8 +111,10 @@ class Client:
         if self.last:time.sleep(max(0,1.2-(now-self.last)))
         self.last=time.monotonic()
         req=Request(BASE+path+('?' + urlencode(params) if params else ''),headers={'Authorization':'Bearer '+token,'Accept':'application/json','User-Agent':'GiftRadar/1.0'})
+        reservation=self.billing.reserve() if self.billing and (path=='gifts' or path.startswith('gift/')) else None
         try:
             with self.opener.open(req,timeout=20) as resp:
+                if reservation:self.billing.settle(reservation,resp.headers.get('X-Request-Cost'))
                 payload=json.loads(resp.read(4_000_000))
                 try:self.remaining=int(resp.headers.get('X-Free-Remaining',''))
                 except (ValueError,TypeError):self.remaining=None
@@ -120,6 +122,7 @@ class Client:
                 if not isinstance(payload,dict) or payload.get('ok') is not True:raise GiftError('Источник данных вернул неожиданный ответ.')
                 return payload.get('result')
         except HTTPError as e:
+            if reservation:self.billing.settle(reservation,e.headers.get('X-Request-Cost') if e.headers else None)
             log.warning('see endpoint=%s HTTP=%s',path.split('/')[0],e.code)
             if e.code==429:
                 try:wait=max(60,int(e.headers.get('Retry-After','60')))
@@ -135,7 +138,7 @@ class Client:
     def _free(self):
         # Recheck quota every cache miss; no billable calls after quota is exhausted.
         self._request('ping')
-        if self.remaining is None or self.remaining<1:raise GiftError('Бесплатная квота не подтверждена или закончилась. Запрос отменён.')
+        if self.remaining is None or (self.remaining<1 and not (self.billing and self.billing.settings()['paid'])):raise GiftError('Бесплатная квота не подтверждена или закончилась. Запрос отменён.')
     def search(self,count,filters=None,mode=None,*,exclude=None,number_window=None):
         if type(count) is not int or not 1<=count<=MAX_BATCH:raise ValueError('Количество: от 1 до 50.')
         filters=filters or {}
@@ -221,7 +224,7 @@ class Client:
             log.info('gift diverse sample bands=%s returned=%s',len(pools),len(result))
             return result
 
-    def single(self,slug):
+    def single(self,slug,*,include_owner=True):
         if not isinstance(slug,str) or not SLUG.fullmatch(slug):raise ValueError('Формат: /gift PlushPepe-1')
         with self.lock:
             self._free();raw=self._request('gift/'+slug)
@@ -233,6 +236,7 @@ class Client:
             log.warning('gift card identifier mismatch')
             raise GiftError('Источник данных: получена карточка другого подарка.')
         log.info('gift card schema accepted')
+        if not include_owner:return item
         # Single, explicit inspection in admin private chat only; never cached/exported in batches.
         gift=raw.get('gift')
         containers=(raw, gift) if isinstance(gift,dict) else (raw,)

@@ -11,6 +11,8 @@ class HistoryTests(unittest.TestCase):
         p=patch.multiple(app,DB=Path(t.name)/'db.sqlite',ADMIN_IDS={99});p.start();self.addCleanup(p.stop)
         p=patch.object(see_api,'enabled',return_value=True);p.start();self.addCleanup(p.stop)
         self.c=see_api.Client()
+        # History tests are independent of cooldown. The new limits have their own tests.
+        p=patch.object(app.usage,"settings",return_value={**app.limits.DEFAULT,"cooldown":0});p.start();self.addCleanup(p.stop)
     def test_next_page_and_no_repeat(self):
         pages=[{'items':[raw(i) for i in range(1,5)],'nextCursor':'opaque-next'}, {'items':[raw(i) for i in range(4,9)]}]
         with patch.object(see_api,'client',self.c),patch.object(self.c,'_free'),patch.object(self.c,'_request',side_effect=pages) as req:
@@ -37,8 +39,8 @@ class HistoryTests(unittest.TestCase):
         app.clear_seen(100);self.assertEqual(app.seen_gifts(99),{'plushpepe-2'})
         app.clear_seen(99);self.assertFalse(app.seen_gifts(99))
     def test_preferences(self):
-        self.assertEqual(app.set_count(99,37),37)
-        self.assertEqual(app.preferred_count(99),37)
+        self.assertEqual(app.set_count(99,25),25)
+        self.assertEqual(app.preferred_count(99),25)
         self.assertEqual(app.preferred_count(100),10)
         with self.assertRaises(ValueError):app.set_count(100,37)
         with self.assertRaises(ValueError):app.set_count(99,51)

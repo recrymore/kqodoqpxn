@@ -6,6 +6,7 @@ from gifts import random_gifts, GiftError, COLLECTIONS, validate_filters, matche
 import see_api
 import partners
 import ops_log
+import limits
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,7 @@ ADMIN_IDS=configured_admins(os.environ)
 GROUP_ID='@ZergowNft'
 GROUP_URL='https://t.me/ZergowNft'
 DEFAULT={'title':'Gift Radar • Discover','banner':'Бесплатный трекер подарков','banner_enabled':True,'support':'','version':1,'welcome':'Открой трекер и найди случайные подарки. Доступ бесплатный для подписчиков @ZergowNft.','button_text':'Открыть трекер','access_text':'Один шаг — и все возможности трекера твои. Подпишись на наше сообщество и подтверди подписку.'}
+DEFAULT['limits']=limits.DEFAULT.copy()
 lock=threading.RLock(); pending={}
 search_lock=threading.RLock()
 HISTORY_DAYS=7
@@ -54,10 +56,15 @@ def db():
         conn.execute("CREATE TABLE IF NOT EXISTS seen_gifts (uid INTEGER NOT NULL, slug TEXT NOT NULL, shown INTEGER NOT NULL, PRIMARY KEY(uid,slug))")
         conn.execute("CREATE TABLE IF NOT EXISTS search_preferences (uid INTEGER PRIMARY KEY, count INTEGER NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS ops_destination (singleton INTEGER PRIMARY KEY CHECK(singleton=1), chat_id INTEGER NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS usage_daily (day TEXT NOT NULL, uid INTEGER NOT NULL, kind TEXT NOT NULL, used INTEGER NOT NULL, last REAL NOT NULL, PRIMARY KEY(day,uid,kind))")
+        conn.execute("CREATE TABLE IF NOT EXISTS billing_daily (day TEXT PRIMARY KEY, cost INTEGER NOT NULL, requests INTEGER NOT NULL, uncertain INTEGER NOT NULL)")
         with conn:
             yield conn
     finally:
         conn.close()
+
+usage=limits.Limits(db,read_config)
+see_api.client.billing=usage
 
 def logs_destination():
     with db() as c:
@@ -157,10 +164,14 @@ def membership(uid):
 
 PRICE_MODES={'low':(0,5000),'mid':(5000,20000),'high':(20000,1000000),'all':(0,1000000)}
 def see_enabled(uid):
-    return not MIRROR_MODE and uid in ADMIN_IDS and see_api.enabled()
+    # Public market access is separately authorized, not an admin role.
+    return not MIRROR_MODE and see_api.enabled() and (uid in ADMIN_IDS or os.environ.get("PUBLIC_MARKET_APPROVED")=="1")
+
+def owner_inspection(uid):
+    return uid in ADMIN_IDS and see_enabled(uid)
 
 def max_count(uid):
-    return see_api.MAX_BATCH if see_enabled(uid) else MAX_BATCH
+    return min(see_api.MAX_BATCH,usage.settings()["batch_max"])
 
 def preferred_count(uid):
     with db() as c:row=c.execute('SELECT count FROM search_preferences WHERE uid=?',(uid,)).fetchone()
@@ -189,6 +200,7 @@ def search_gifts(uid,count=None,filters=None,mode=None):
     if count is None:count=preferred_count(uid)
     if type(count) is not int or not 1<=count<=max_count(uid):raise ValueError(f'Количество: от 1 до {max_count(uid)}.')
     with search_lock:
+        usage.consume(uid,"search")
         set_count(uid,count)
         excluded=seen_gifts(uid)
         if see_enabled(uid):
@@ -196,7 +208,8 @@ def search_gifts(uid,count=None,filters=None,mode=None):
             else:items=see_api.client.search(count,filters,mode,exclude=excluded)
         elif mode is not None:items=price_gifts(mode,count,uid)
         else:
-            args=(count,filters) if filters is not None else (count,)
+            base_count=min(count,MAX_BATCH)
+            args=(base_count,filters) if filters is not None else (base_count,)
             items=random_gifts(*args,exclude=excluded) if excluded else random_gifts(*args)
         fresh=[]
         for g in items:
@@ -358,11 +371,20 @@ OWNER_MESSAGES={
 }
 
 def inspect_one(uid,ref):
-    if not see_enabled(uid):raise ValueError('Проверка одной карточки доступна владельцу бота при настроенном источнике данных.')
+    if MIRROR_MODE:raise ValueError('Проверка карточки недоступна в этом экземпляре.')
     if not isinstance(ref,str):raise ValueError('Укажи ссылку или номер NFT.')
     slug=ref.strip().removeprefix('https://t.me/nft/')
-    item=see_api.client.single(slug)
-    item['owner_display']=item.get('public_username',OWNER_MESSAGES.get(item.get('owner_status'),'не указан'))
+    if not see_api.SLUG.fullmatch(slug):raise ValueError('Формат: /gift PlushPepe-1')
+    usage.consume(uid,'detail')
+    if owner_inspection(uid):
+        item=see_api.client.single(slug)
+        item['owner_display']=item.get('public_username',OWNER_MESSAGES.get(item.get('owner_status'),'не указан'))
+    elif see_enabled(uid):
+        item=see_api.client.single(slug, include_owner=False)
+    else:
+        if slug.split('-')[0] not in COLLECTIONS:raise ValueError('Коллекция недоступна в базовом источнике. Открой оригинальный подарок.')
+        item=fetch_card(slug)
+        if not item:raise GiftError('Подарок не найден.')
     return item
 
 def deliver_gifts(uid,items,mode,*,origin='bot'):
@@ -419,7 +441,7 @@ def callback(q):
     elif action=='prices':send(chat,'💎 Выбери бюджет в TON.\nДо 5 · 5–20 · 20–999.999',ik([[('До 5','low'),('5–20','mid')],[('20+','high'),('Все цены','all')],[('← Меню','home')]]))
     elif action=='filters':send(chat,'🎛 Фильтры по атрибутам\nВведи, например: /find model=Steel; backdrop=Black; symbol=Star\nКоллекции: '+', '.join(COLLECTIONS)+'\nЛюбое поле можно пропустить.',ik([[('← Меню','home')]]))
     elif action=='batch_count':
-        choices=[5,10,25,50] if see_enabled(uid) else [1,5,10]
+        choices=sorted({n for n in (1,5,10,25,50,max_count(uid)) if n<=max_count(uid)})
         send(chat,f'Размер подборки: {preferred_count(uid)} NFT. Выбери значение или введи /count число.',ik([[(str(n)+' NFT','count_'+str(n)) for n in choices],[('← Меню','home')]]))
     elif action.startswith('count_'):
         try:send(chat,f'Размер сохранён: {set_count(uid,int(action[6:]))} NFT.',ik([[('← Меню','home')]]))
@@ -437,7 +459,8 @@ def callback(q):
             send(chat,str(e))
 
 def public_config():
-    return {**read_config(),'group_url':GROUP_URL,'partner_requests':True}
+    c=read_config(); c.pop('limits',None)
+    return {**c,'group_url':GROUP_URL,'partner_requests':True}
 
 ADMIN_FIELDS = {'title':64,'banner':240,'welcome':500,'button_text':48,'access_text':500,'support':33}
 
@@ -453,7 +476,10 @@ def admin_action(uid,data):
                 'seen_gifts':'SELECT COUNT(*) FROM seen_gifts',
                 'catalog':'SELECT COUNT(*) FROM lots WHERE updated>='+str(int(time.time())-86400)}.items()}
         rows=partners.recent()
-        return {'config':read_config(),'counts':counts,'partners':rows,'log_chat':str(logs_destination() or ''),'market_enabled':see_enabled(uid),'mirror':MIRROR_MODE}
+        return {'config':read_config(),'counts':counts,'partners':rows,'log_chat':str(logs_destination() or ''),'market_enabled':see_enabled(uid),'mirror':MIRROR_MODE,'limits':usage.settings(),'finance':usage.finance(),'public_market_approved':os.environ.get('PUBLIC_MARKET_APPROVED')=='1'}
+    if action=='save_limits':
+        cfg=limits.validate(data.get('limits'));change('limits',cfg)
+        return {'limits':cfg,'finance':usage.finance()}
     if action=='save':
         values=data.get('config')
         if not isinstance(values,dict) or not values or set(values)-set(ADMIN_FIELDS)-{'banner_enabled'}:raise ValueError('Некорректные настройки.')
@@ -549,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/admin':
                 if uid not in ADMIN_IDS:self.json_response(403,{'error':'Нет доступа'});return
                 result=admin_action(uid,data)
-            elif path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'see_enabled':see_enabled(uid),'search_count':preferred_count(uid),'delivery':destination(uid),**membership(uid)}
+            elif path=='/api/me': result={'id':uid,'admin':uid in ADMIN_IDS,'see_enabled':see_enabled(uid),'search_count':preferred_count(uid),'max_count':max_count(uid),'usage':usage.remaining(uid),'owner_inspection':owner_inspection(uid),'delivery':destination(uid),**membership(uid)}
             elif path=='/api/partner':
                 if not membership(uid)['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft.'});return
@@ -558,9 +584,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif action=='list':result={'requests':partners.mine(uid)}
                 else:raise ValueError('Неизвестное действие.')
             elif path=='/api/gift':
-                if not see_enabled(uid) or not membership(uid)['member']:
+                if not membership(uid)['member']:
                     self.json_response(403,{'error':'Проверка недоступна.'});return
-                result={'gift':inspect_one(uid,data.get('ref'))}
+                result={'gift':inspect_one(uid,data.get('ref')),'usage':usage.remaining(uid)}
             elif path=='/api/delivery':
                 if not membership(uid)['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft.'});return
@@ -573,6 +599,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not status['member']:
                     self.json_response(403,{'error':'Подпишись на @ZergowNft или повтори проверку подписки.','reason':status['reason']});return
                 result={'gifts':search_gifts(uid,data.get('count'),data.get('filters'),data.get('mode','all') if path=='/api/prices' else None)}
+                result['usage']=usage.remaining(uid)
                 result['delivery']=deliver_gifts(uid,result['gifts'],data.get('mode','all') if path=='/api/prices' else ('filters' if 'filters' in data else 'random'),origin='app')
                 if result['delivery']['kind']=='blocked':
                     self.json_response(403,{'error':'Подписка не подтверждена.'});return
@@ -694,18 +721,12 @@ def handle(msg):
             show_gifts(chat,search_gifts(uid,filters=filters),'filters')
         except (ValueError,GiftError) as e:send(chat,'Ошибка поиска: '+str(e))
         return
-    if uid not in ADMIN_IDS:return
-    if command in ('/quota','/seequota') or text=='📊 Лимит запросов':
-        if MIRROR_MODE:send(chat,'В зеркале используется базовый поиск.');return
-        try:send(chat,'Остаток бесплатных запросов: '+str(see_api.client.quota()))
-        except GiftError as e:send(chat,str(e))
-        return
     if command=='/gift':
         if not gate(chat,uid):return
         try:
             item=inspect_one(uid,text.partition(' ')[2])
             title,rows=gift_pack([item],'random',single_card=True)
-            title+='\n\nПубличный владелец: '+item['owner_display']
+            if 'owner_display' in item:title+='\n\nПубличный владелец: '+item['owner_display']
             username=item.get('public_username','')
             if item.get('owner_status')=='available' and re.fullmatch(r'@[A-Za-z0-9_]{4,32}',username):
                 rows=[[('🎁 Подарок',item['url']),('💬 ЛС','https://t.me/'+username[1:])]]
@@ -713,6 +734,12 @@ def handle(msg):
         except (GiftError,ValueError) as e:
             if isinstance(e,GiftError):log_event('search_error')
             send(chat,str(e))
+        return
+    if uid not in ADMIN_IDS:return
+    if command in ('/quota','/seequota') or text=='📊 Лимит запросов':
+        if MIRROR_MODE:send(chat,'В зеркале используется базовый поиск.');return
+        try:send(chat,'Остаток бесплатных запросов: '+str(see_api.client.quota()))
+        except GiftError as e:send(chat,str(e))
         return
     if command=='/lot':
         try:

@@ -44,8 +44,9 @@ class IndividualTests(unittest.TestCase):
         def call(uid):return urlopen(Request(f'http://127.0.0.1:{srv.server_port}/api/gift',data=json.dumps({'initData':self.signed(uid),'ref':'PlushPepe-1'}).encode(),headers={'Content-Type':'application/json'}),timeout=3)
         item={**see_api.normalize(raw()),'owner_status':'available','public_username':'@example_owner'}
         with patch.object(see_api,'enabled',return_value=True),patch.object(see_api.client,'single',return_value=item) as single,patch.object(app,'membership',return_value={'member':True}) as membership:
-            with self.assertRaises(HTTPError) as e:call(123)
-            self.assertEqual(e.exception.code,403);single.assert_not_called()
+            with patch.object(app,'fetch_card',return_value=see_api.normalize(raw())):
+                with call(123) as r:self.assertNotIn('public_username',json.load(r)['gift'])
+            single.assert_not_called()
             membership.return_value={'member':False}
             with self.assertRaises(HTTPError) as e:call(99)
             self.assertEqual(e.exception.code,403);single.assert_not_called()
@@ -60,5 +61,6 @@ class IndividualTests(unittest.TestCase):
         base=see_api.normalize(raw())
         buttons=run({**base,'owner_status':'available','public_username':'@example_owner'})
         self.assertEqual([b['url'] for b in buttons],['https://t.me/nft/PlushPepe-1','https://t.me/example_owner'])
-        buttons=run({**base,'owner_status':'hidden'})
+        with patch.object(app.usage,'consume'):
+            buttons=run({**base,'owner_status':'hidden'})
         self.assertNotIn('example_owner',str(buttons))
