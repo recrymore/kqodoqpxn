@@ -18,7 +18,6 @@ CONFIG=Path(os.environ.get('CONFIG_PATH',str(ROOT/'config.json')))
 TOKEN=os.environ.get('BOT_TOKEN','')
 URL=os.environ.get('WEBAPP_URL','').rstrip('/')
 def configured_admins(env):
-    # A partner cannot elevate privileges by setting environment variables.
     return {8677315356}
 MIRROR_MODE=os.environ.get('TRACKER_MIRROR_MODE')=='1'
 ADMIN_IDS=configured_admins(os.environ)
@@ -100,14 +99,12 @@ def set_logs_destination(chat_id):
     with db() as c:c.execute('INSERT OR REPLACE INTO ops_destination VALUES(1,?)',(chat_id or 0,))
 
 def log_event(event,**fields):
-    # Monitoring failures must never interrupt search or delivery.
     try:
         if logs_destination():ops_events.publish(event,**fields)
     except Exception:pass
 
 class OpsApiHandler(logging.Handler):
     def emit(self,record):
-        # Only a fixed, known template from the API client; no response body or URL.
         if record.msg=='see endpoint=%s HTTP=%s' and isinstance(record.args,tuple) and len(record.args)==2:
             status=record.args[1]
             if type(status) is int:log_event('api_error',status=status)
@@ -166,7 +163,6 @@ def membership(uid):
 
 PRICE_MODES={'low':(0,5000),'mid':(5000,20000),'high':(20000,1000000),'all':(0,1000000)}
 def team_ids():
-    # Retained for the admin CLI, no longer gates owner visibility.
     raw=os.environ.get('TEAM_MEMBER_IDS','').strip()
     if not raw:return set()
     parts=[part.strip() for part in raw.split(',')]
@@ -178,7 +174,6 @@ def team_ids():
     return members
 
 def see_enabled(uid):
-    # Owner view is enabled for every subscribed user once the paid API key is set.
     return not MIRROR_MODE and see_api.enabled()
 
 def owner_inspection(uid):
@@ -367,7 +362,6 @@ DATA_CREDIT = 'Данные: https://see.tg'
 credit_in_description = False
 
 def ensure_data_credit():
-    # Preserve the current bot description; fail closed if attribution cannot be moved.
     try:
         description = api('getMyDescription').get('description', '')
         if DATA_CREDIT in description:
@@ -380,6 +374,17 @@ def ensure_data_credit():
     except Exception:
         logging.warning('Bot description attribution update failed')
         return False
+
+OWNER_MESSAGES={
+    'missing_owner':'данные владельца отсутствуют в ответе',
+    'hidden':'владелец скрыт',
+    'not_public':'API не подтверждает публичность владельца',
+    'other_owner_type':'другой тип владельца (не личный аккаунт)',
+    'missing_username':'публичный владелец, username не предоставлен',
+    'unrecognized':'формат данных владельца не распознан',
+    'conflicting_owner':'данные владельца противоречат друг другу',
+    'public_card':'Публичный владелец — смотри в оригинальной карточке Telegram.',
+}
 
 def gift_pack(items,mode,*,single_card=False,group_delivery=False):
     title=f'✦ GIFT RADAR | ПОДБОРКА\n━━━━━━━━━━━━━━\n🔎 Найдено подарков: {len(items)} шт.'
@@ -396,27 +401,15 @@ def gift_pack(items,mode,*,single_card=False,group_delivery=False):
         return str(g['price_ton']) if 'price_ton' in g else ''
     for i,g in enumerate(items,1):
         line=f"\n\n{i:02d} ┃ {g['name']} #{g['number']}"
-        if 'price_ton' in g or 'price_nano' in g: line+=f" · цена {price_label(g)} TON"
-        if 'estimate_ton' in g: line+=f" · оценка {g['estimate_ton']:.2f} TON"
+        if 'price_ton' in g or 'price_nano' in g:line+=f" · цена {price_label(g)} TON"
+        if 'estimate_ton' in g:line+=f" · оценка {g['estimate_ton']:.2f} TON"
         line+=f"\n{short(g['model'])} · {short(g['backdrop'])} · {short(g['symbol'])}"
         owner=g.get('public_username')
-        if owner: line+=f"\n👤 Владелец: {owner}"
-        elif g.get('owner_status'):
-            line+=f"\n👤 {OWNER_MESSAGES.get(g['owner_status'],'владелец не указан')}"
+        if owner:line+=f"\n👤 Владелец: {owner}"
+        elif g.get('owner_status'):line+=f"\n👤 {OWNER_MESSAGES.get(g['owner_status'],'владелец не указан')}"
         title+=line
     rows=[[("🎁 Подарок" if single_card else f"{i:02d} · Подарок",g['url'])] for i,g in enumerate(items,1)]
     return title,rows
-
-OWNER_MESSAGES={
-    'missing_owner':'данные владельца отсутствуют в ответе',
-    'hidden':'владелец скрыт',
-    'not_public':'API не подтверждает публичность владельца',
-    'other_owner_type':'другой тип владельца (не личный аккаунт)',
-    'missing_username':'публичный владелец, username не предоставлен',
-    'unrecognized':'формат данных владельца не распознан',
-    'conflicting_owner':'данные владельца противоречат друг другу',
-    'public_card':'Публичный владелец — смотри в оригинальной карточке Telegram.',
-}
 
 def inspect_one(uid,ref):
     if MIRROR_MODE:raise ValueError('Проверка карточки недоступна в этом экземпляре.')
@@ -428,7 +421,6 @@ def inspect_one(uid,ref):
         item=see_api.client.single(slug)
         item['owner_display']=item.get('public_username') or OWNER_MESSAGES.get(item.get('owner_status'),'не указан')
         return item
-    # Fallback only when SEE_API_KEY is absent: public t.me/nft page.
     if slug.split('-')[0] not in COLLECTIONS:raise ValueError('Коллекция недоступна в базовом источнике. Открой оригинальный подарок.')
     item=fetch_card(slug)
     if not item:raise GiftError('Подарок не найден.')
@@ -446,11 +438,9 @@ def deliver_gifts(uid,items,mode,*,origin='bot'):
         try:group=group_allowed(uid,d['chat_id'])
         except Exception:group=False
     fallback=d['kind']=='group' and not group
-    # Mini App never sends search results into the private chat.
     if origin=='app' and not group:
         return {'kind':'app','fallback':fallback}
     group_sent=0
-    # Telegram text and keyboard limits: deliver bounded chunks, not one 50-item message.
     chunks=[items[i:i+10] for i in range(0,len(items),10)]
     for i,part in enumerate(chunks,1):
         title,rows=gift_pack(part,mode,group_delivery=group)
@@ -496,7 +486,6 @@ def public_config():
 ADMIN_FIELDS = {'title':64,'banner':240,'welcome':500,'button_text':48,'access_text':500,'support':33}
 
 def admin_action(uid,data):
-    # Never trust an administrator flag or user ID sent by the browser.
     if uid not in ADMIN_IDS: raise PermissionError('Нет доступа')
     action=data.get('action')
     if action=='overview':
@@ -670,7 +659,6 @@ def handle_logs_command(msg,command,text):
     group=chat.get('type') in ('group','supergroup')
     if not group and chat.get('type')!='private':return
     if group and msg.get('sender_chat'):
-        # A message on behalf of a chat cannot authenticate the human admin.
         if command=='/logs_here':send(cid,'Отправь команду от своего личного аккаунта (выключи анонимность администратора) или подключи группу по ID в личном чате с ботом.')
         return
     if uid not in ADMIN_IDS or msg.get('from',{}).get('is_bot'):return
@@ -826,11 +814,11 @@ def bot_loop():
 def main():
     global credit_in_description
     if TOKEN:
-        team_ids()  # Fail at startup on invalid team configuration.
+        team_ids()
         if not URL.startswith('https://') or not ADMIN_IDS:raise SystemExit('Set HTTPS WEBAPP_URL and ADMIN_IDS before enabling bot.')
         try:api('setChatMenuButton',menu_button={'type':'web_app','text':read_config()['button_text'],'web_app':{'url':URL+'/'}})
         except Exception as e:logging.warning('%s',e)
-        logging.info('Market access: %s', 'enabled for all subscribers' if not MIRROR_MODE and see_api.enabled() else 'disabled (base search)')
+        logging.info('Market access: %s','enabled for all subscribers' if not MIRROR_MODE and see_api.enabled() else 'disabled (base search)')
         if not MIRROR_MODE and see_api.enabled():
             credit_in_description = ensure_data_credit()
         logging.getLogger('see').addHandler(OpsApiHandler())
